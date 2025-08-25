@@ -1,0 +1,73 @@
+version: "3.8"
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: autopost
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - appnet
+
+  redis:
+    image: redis:7
+    networks:
+      - appnet
+
+  web:
+    build: .
+    command: uvicorn app.api:app --host 0.0.0.0 --port 8000 --proxy-headers
+    env_file: .env
+    volumes:
+      - ./:/srv/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - appnet
+
+  bot:
+    build: .
+    command: python -m app.main_bot
+    env_file: .env
+    volumes:
+      - ./:/srv/app
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - appnet
+
+  worker:
+    build: .
+    command: celery -A app.celery_app.celery worker --loglevel=info --concurrency=1 -Ofair
+    env_file: .env
+    volumes:
+      - ./:/srv/app
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - appnet
+
+  beat:
+    build: .
+    command: celery -A app.celery_app.celery beat --loglevel=info -S celery.beat:PersistentScheduler --pidfile=/tmp/celerybeat.pid
+    env_file: .env
+    volumes:
+      - ./:/srv/app
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - appnet
+
+volumes:
+  pgdata:
+
+networks:
+  appnet:
