@@ -40,6 +40,7 @@ class Post(Base):
     button_text = Column(String(255))
     button_url = Column(String(1000))
     buttons = Column(JSONB, nullable=True)  # [{"text":"...","url":"..."}, ...]
+    media_group = Column(JSONB, nullable=True)  # [{"type":"photo|video|document","file_id":"..."}, ...]
     next_run = Column(DateTime(timezone=True), index=True)
     repeat_type = Column(String(50))  # legacy, не используем
     repeat_val = Column(Integer, nullable=True)  # legacy

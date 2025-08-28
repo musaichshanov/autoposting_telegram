@@ -55,6 +55,7 @@ class NewPost(StatesGroup):
     ask_button = State()
     input_button = State()
     choose_parse = State()
+    preview = State()
 
 class ManageAdmins(StatesGroup):
     wait_input = State()
@@ -572,42 +573,51 @@ async def np_view_post(cq: types.CallbackQuery, state: FSMContext):
     except Exception:
         when_str = "не запланирован"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb_manage = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"np_start_edit:{p.id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"np_del_confirm:{p.id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_wd:{p.weekday}")],
     ])
-
-    # Если есть медиа — отправим медиа с подписью и кнопками
-    if p.media_type and p.media_file_id:
-        caption_parts = []
-        if p.text:
-            # ограничим длину подписи, чтобы поместиться в лимит
-            caption_parts.append(p.text[:900])
-        caption_parts.append(f"Время: {when_str}")
-        caption = "\n".join(caption_parts)
+    # подготавливаем entities для форматирования
+    entities = None
+    if p.text_entities:
         try:
-            await cq.message.delete()
+            from aiogram.types import MessageEntity
+            entities = [MessageEntity(**e) for e in p.text_entities]
         except Exception:
-            pass
-        if p.media_type == "photo":
-            await bot.send_photo(chat_id=cq.message.chat.id, photo=p.media_file_id, caption=caption, reply_markup=kb)
-        elif p.media_type == "video":
-            await bot.send_video(chat_id=cq.message.chat.id, video=p.media_file_id, caption=caption, reply_markup=kb)
-        elif p.media_type == "document":
-            await bot.send_document(chat_id=cq.message.chat.id, document=p.media_file_id, caption=caption, reply_markup=kb)
-        else:
-            # неизвестный тип — просто текстом
-            await bot.send_message(chat_id=cq.message.chat.id, text=caption, reply_markup=kb)
+            entities = None
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    if p.media_group:
+        # отправим альбом, потом отдельным сообщением текст с форматированием и клавиатурой управления
+        from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
+        media = []
+        for it in p.media_group:
+            t = it.get("type")
+            fid = it.get("file_id")
+            if t == "photo":
+                media.append(InputMediaPhoto(media=fid))
+            elif t == "video":
+                media.append(InputMediaVideo(media=fid))
+            elif t == "document":
+                media.append(InputMediaDocument(media=fid))
+        if media:
+            await bot.send_media_group(chat_id=cq.message.chat.id, media=media)
+        text_preview = p.text or "Предпросмотр медиагруппы"
+        await bot.send_message(chat_id=cq.message.chat.id, text=text_preview, entities=entities, reply_markup=kb_manage)
+    elif p.media_type == "photo":
+        await bot.send_photo(chat_id=cq.message.chat.id, photo=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
+    elif p.media_type == "video":
+        await bot.send_video(chat_id=cq.message.chat.id, video=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
+    elif p.media_type == "document":
+        await bot.send_document(chat_id=cq.message.chat.id, document=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
+    elif p.media_type == "video_note":
+        await bot.send_video_note(chat_id=cq.message.chat.id, video_note=p.media_file_id)
+        await bot.send_message(chat_id=cq.message.chat.id, text=(p.text or "Кружок."), entities=entities, reply_markup=kb_manage)
     else:
-        # Без медиа — покажем подробности текстом
-        summary = ["Пост:"]
-        if p.text:
-            summary.append(f"Текст: {p.text[:1000]}")
-        summary.append(f"Время: {when_str}")
-        if p.button_text and p.button_url:
-            summary.append(f"Кнопка: {p.button_text} → {p.button_url}")
-        await cq.message.edit_text("\n".join(summary), reply_markup=kb)
+        await bot.send_message(chat_id=cq.message.chat.id, text=(p.text or "Пост без текста"), entities=entities, reply_markup=kb_manage)
     await cq.answer()
 
 # Подтверждение удаления поста
@@ -703,6 +713,7 @@ async def np_input_text(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(NewPost.input_media))
 async def np_input_media(message: types.Message, state: FSMContext):
     media_type, media_id = None, None
+    media_group = None
     if message.text and message.text.strip() == "-":
         # в режиме редактирования '-' оставит медиа без изменений
         pass
@@ -718,6 +729,27 @@ async def np_input_media(message: types.Message, state: FSMContext):
     elif message.animation:
         media_type = "document"
         media_id = message.animation.file_id
+    elif message.video_note:
+        # кружок — отдельный тип, у него нет caption и кнопок
+        media_type = "video_note"
+        media_id = message.video_note.file_id
+        await message.answer("Добавлен кружок. Учти: к кружкам нельзя добавлять подпись и кнопки.")
+    elif message.media_group_id:
+        # медиагруппа: соберём файлы из альбома
+        # в aiogram 3 альбом приходит серией сообщений; здесь мы фиксируем один элемент
+        item = None
+        if message.photo:
+            item = {"type": "photo", "file_id": message.photo[-1].file_id}
+        elif message.video:
+            item = {"type": "video", "file_id": message.video.file_id}
+        elif message.document:
+            item = {"type": "document", "file_id": message.document.file_id}
+        if item:
+            cur = (await state.get_data()).get("media_group") or []
+            cur.append(item)
+            await state.update_data(media_group=cur)
+            await message.answer("Медиагруппа: элемент добавлен. Отправь ещё элементы альбома или '-' для завершения.")
+            return
     await state.update_data(media_type=media_type, media_file_id=media_id)
     await state.set_state(NewPost.ask_button)
     buttons = (await state.get_data()).get("buttons") or []
@@ -742,8 +774,9 @@ async def np_buttons_menu(cq: types.CallbackQuery, state: FSMContext):
         await state.update_data(buttons=[])
         await cq.message.edit_text("Кнопки очищены. Можно добавить новые или продолжить.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")],[InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")]]))
     else:
-        # Готово — сразу сохраняем слот (формат определяется автоматически)
-        await finalize_post(cq.message, state)
+        # Готово — показываем предпросмотр перед сохранением
+        await state.set_state(NewPost.preview)
+        await send_post_preview(cq.message, state)
     await cq.answer()
 
 # Если в состоянии выбора кнопок пользователь прислал текст, а не нажал inline — повторно показываем меню
@@ -873,6 +906,100 @@ async def finalize_post(message_or_message, state: FSMContext):
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_start")],
     ])
     await message_or_message.answer("Слот сохранён.", reply_markup=end_kb)
+
+# Предпросмотр слота перед сохранением
+async def send_post_preview(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    text = data.get("text")
+    text_entities = data.get("text_entities")
+    media_type = data.get("media_type")
+    media_file_id = data.get("media_file_id")
+    media_group = data.get("media_group")
+    buttons = data.get("buttons") or []
+
+    # Собираем клавиатуру поста (внешние кнопки)
+    rows = []
+    for b in buttons:
+        t = (b.get("text") or "").strip()
+        u = (b.get("url") or "").strip()
+        if t and u:
+            rows.append([InlineKeyboardButton(text=t, url=u)])
+    post_kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+    # Entities
+    entities = None
+    if text_entities:
+        try:
+            from aiogram.types import MessageEntity
+            entities = [MessageEntity(**e) for e in text_entities]
+        except Exception:
+            entities = None
+
+    # Предупреждения по ограничениям
+    warn_lines = []
+    if media_type == "video_note" and (text or buttons):
+        warn_lines.append("Внимание: к кружкам нельзя добавлять подпись и кнопки. Текст/кнопки будут отправлены отдельно.")
+    if media_group and buttons:
+        warn_lines.append("Внимание: у медиагруппы нет кнопок — они будут отправлены отдельным сообщением.")
+
+    # Отрисовка предпросмотра
+    if media_group:
+        from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
+        media = []
+        for it in media_group:
+            t = it.get("type")
+            fid = it.get("file_id")
+            if t == "photo":
+                media.append(InputMediaPhoto(media=fid))
+            elif t == "video":
+                media.append(InputMediaVideo(media=fid))
+            elif t == "document":
+                media.append(InputMediaDocument(media=fid))
+        if media:
+            await bot.send_media_group(chat_id=message.chat.id, media=media)
+        if text or post_kb or warn_lines:
+            extra = ("\n"+"\n".join(warn_lines)) if warn_lines else ""
+            await bot.send_message(chat_id=message.chat.id, text=(text or "Предпросмотр медиагруппы")+extra, entities=entities, reply_markup=post_kb)
+    elif media_type == "photo":
+        await bot.send_photo(chat_id=message.chat.id, photo=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
+    elif media_type == "video":
+        await bot.send_video(chat_id=message.chat.id, video=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
+    elif media_type == "document":
+        await bot.send_document(chat_id=message.chat.id, document=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
+    elif media_type == "video_note":
+        await bot.send_video_note(chat_id=message.chat.id, video_note=media_file_id)
+        if text or buttons or warn_lines:
+            extra = ("\n"+"\n".join(warn_lines)) if warn_lines else ""
+            await bot.send_message(chat_id=message.chat.id, text=(text or "Кружок")+extra, entities=entities)
+    else:
+        await bot.send_message(chat_id=message.chat.id, text=(text or "Пост без текста"), entities=entities, reply_markup=post_kb)
+
+    # Кнопки подтверждения предпросмотра
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить", callback_data="np_preview_save")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="np_preview_back")],
+    ])
+    await bot.send_message(chat_id=message.chat.id, text="Сохранить этот слот?", reply_markup=confirm_kb)
+
+@dp.callback_query(lambda c: c.data=="np_preview_save", StateFilter(NewPost.preview))
+async def np_preview_save(cq: types.CallbackQuery, state: FSMContext):
+    await finalize_post(cq.message, state)
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data=="np_preview_back", StateFilter(NewPost.preview))
+async def np_preview_back(cq: types.CallbackQuery, state: FSMContext):
+    # вернёмся в меню кнопок
+    await state.set_state(NewPost.ask_button)
+    data = await state.get_data()
+    buttons = data.get("buttons") or []
+    rows = [[InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")]]
+    if buttons:
+        rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="np_btn_done")])
+        rows.append([InlineKeyboardButton(text="🗑 Очистить", callback_data="np_btn_clear")])
+    else:
+        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")])
+    await cq.message.edit_text("Кнопки поста:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cq.answer()
 
 async def render_day_posts_menu(message: types.Message, ch_id: int, week: int, wd: int):
     async def safe_edit_message_text(msg: types.Message, text: str, kb: InlineKeyboardMarkup | None = None):

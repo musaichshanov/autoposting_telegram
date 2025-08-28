@@ -4,6 +4,7 @@ from .models import Post, Channel
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import MessageEntity
+from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 import os
 import asyncio
 from sqlalchemy.future import select
@@ -99,12 +100,32 @@ async def _send_post_async(post_id: int):
                     return "MarkdownV2"
                 return None
             pm = None if entities else detect_parse_mode(p.text)
-            if p.media_type == "photo":
+            # Медиагруппа: Telegram не поддерживает кнопки/единый caption на группу в простом случае
+            if p.media_group:
+                media = []
+                for it in p.media_group:
+                    t = it.get("type")
+                    fid = it.get("file_id")
+                    if t == "photo":
+                        media.append(InputMediaPhoto(media=fid))
+                    elif t == "video":
+                        media.append(InputMediaVideo(media=fid))
+                    elif t == "document":
+                        media.append(InputMediaDocument(media=fid))
+                if media:
+                    await bot.send_media_group(chat_id=ch.chat_id, media=media)
+                # После группы отправим текст отдельно (если есть) с кнопками
+                if p.text:
+                    await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "photo":
                 await bot.send_photo(chat_id=ch.chat_id, photo=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
             elif p.media_type == "video":
                 await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
             elif p.media_type == "document":
                 await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "video_note":
+                # кружок: без caption и без кнопок
+                await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
             else:
                 await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
             # success: compute next_run по МСК
