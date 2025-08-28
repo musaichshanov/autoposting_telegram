@@ -714,9 +714,26 @@ async def np_input_text(message: types.Message, state: FSMContext):
 async def np_input_media(message: types.Message, state: FSMContext):
     media_type, media_id = None, None
     media_group = None
+    # 1) Медиагруппа – приоритетно
+    if getattr(message, "media_group_id", None):
+        item = None
+        if message.photo:
+            item = {"type": "photo", "file_id": message.photo[-1].file_id}
+        elif message.video:
+            item = {"type": "video", "file_id": message.video.file_id}
+        elif message.document:
+            item = {"type": "document", "file_id": message.document.file_id}
+        if item:
+            cur = (await state.get_data()).get("media_group") or []
+            cur.append(item)
+            await state.update_data(media_group=cur)
+            await message.answer("Медиагруппа: элемент добавлен. Отправь ещё элементы альбома или '-' для завершения.")
+            return
+    # 2) Завершение ввода медиа
     if message.text and message.text.strip() == "-":
         # в режиме редактирования '-' оставит медиа без изменений
         pass
+    # 3) Одиночные медиа
     elif message.photo:
         media_type = "photo"
         media_id = message.photo[-1].file_id
@@ -826,6 +843,7 @@ async def finalize_post(message_or_message, state: FSMContext):
     button_url = data.get("button_url")
     text_entities = data.get("text_entities")
     buttons = data.get("buttons") or None
+    media_group = data.get("media_group") or None
 
     async with AsyncSessionLocal() as session:
         # вычисляем next_run
@@ -872,6 +890,8 @@ async def finalize_post(message_or_message, state: FSMContext):
             if media_type is not None:
                 existing.media_type = media_type
                 existing.media_file_id = media_file_id
+            if media_group is not None:
+                existing.media_group = media_group
             # кнопка: если не пришла — оставляем как было
             if button_text is not None and button_url is not None:
                 existing.button_text = button_text
@@ -889,6 +909,7 @@ async def finalize_post(message_or_message, state: FSMContext):
                 text_entities=text_entities,
                 media_type=media_type,
                 media_file_id=media_file_id,
+                media_group=media_group,
                 button_text=button_text,
                 button_url=button_url,
                 buttons=buttons,
