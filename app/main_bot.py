@@ -613,6 +613,8 @@ async def np_view_post(cq: types.CallbackQuery, state: FSMContext):
         await bot.send_video(chat_id=cq.message.chat.id, video=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
     elif p.media_type == "document":
         await bot.send_document(chat_id=cq.message.chat.id, document=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
+    elif p.media_type == "voice":
+        await bot.send_voice(chat_id=cq.message.chat.id, voice=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
     elif p.media_type == "video_note":
         await bot.send_video_note(chat_id=cq.message.chat.id, video_note=p.media_file_id)
         await bot.send_message(chat_id=cq.message.chat.id, text=(p.text or "Кружок."), entities=entities, reply_markup=kb_manage)
@@ -751,6 +753,9 @@ async def np_input_media(message: types.Message, state: FSMContext):
         media_type = "video_note"
         media_id = message.video_note.file_id
         await message.answer("Добавлен кружок. Учти: к кружкам нельзя добавлять подпись и кнопки.")
+    elif message.voice:
+        media_type = "voice"
+        media_id = message.voice.file_id
     elif message.media_group_id:
         # медиагруппа: соберём файлы из альбома
         # в aiogram 3 альбом приходит серией сообщений; здесь мы фиксируем один элемент
@@ -987,6 +992,8 @@ async def send_post_preview(message: types.Message, state: FSMContext):
         await bot.send_video(chat_id=message.chat.id, video=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
     elif media_type == "document":
         await bot.send_document(chat_id=message.chat.id, document=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
+    elif media_type == "voice":
+        await bot.send_voice(chat_id=message.chat.id, voice=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
     elif media_type == "video_note":
         await bot.send_video_note(chat_id=message.chat.id, video_note=media_file_id)
         if text or buttons or warn_lines:

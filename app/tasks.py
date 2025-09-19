@@ -123,6 +123,8 @@ async def _send_post_async(post_id: int):
                 await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
             elif p.media_type == "document":
                 await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "voice":
+                await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
             elif p.media_type == "video_note":
                 # кружок: без caption и без кнопок
                 await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
