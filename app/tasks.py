@@ -100,7 +100,7 @@ async def _send_post_async(post_id: int):
                     return "MarkdownV2"
                 return None
             pm = None if entities else detect_parse_mode(p.text)
-            # Медиагруппа: Telegram не поддерживает кнопки/единый caption на группу в простом случае
+            # Медиагруппа: если есть кнопки, текст отправим отдельно; если кнопок нет, текст кладём как caption первого элемента
             if p.media_group:
                 media = []
                 for it in p.media_group:
@@ -113,23 +113,34 @@ async def _send_post_async(post_id: int):
                     elif t == "document":
                         media.append(InputMediaDocument(media=fid))
                 if media:
+                    # если нет кнопок, перенесём текст в caption первого элемента
+                    if not kb and (p.text or entities):
+                        try:
+                            media[0].caption = p.text
+                            # Aiogram InputMedia* поддерживает и caption_entities и parse_mode
+                            if entities:
+                                media[0].caption_entities = entities
+                            else:
+                                media[0].parse_mode = pm
+                        except Exception:
+                            pass
                     await bot.send_media_group(chat_id=ch.chat_id, media=media)
-                # После группы отправим текст отдельно (если есть) с кнопками
-                if p.text:
+                # Если кнопки есть — отправим текст отдельно с кнопками (ограничение Telegram)
+                if kb and p.text:
                     await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "photo":
-                await bot.send_photo(chat_id=ch.chat_id, photo=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "video":
-                await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "document":
-                await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "voice":
-                await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "video_note":
-                # кружок: без caption и без кнопок
-                await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
-            else:
-                await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
+                elif p.media_type == "photo":
+                    await bot.send_photo(chat_id=ch.chat_id, photo=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+                elif p.media_type == "video":
+                    await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+                elif p.media_type == "document":
+                    await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+                elif p.media_type == "voice":
+                    await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+                elif p.media_type == "video_note":
+                    # кружок: без caption и без кнопок
+                    await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
+                else:
+                    await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
             # success: compute next_run по МСК
             next_run = None
             if p.week_in_cycle is not None and p.weekday is not None and p.time_text:

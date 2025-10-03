@@ -982,10 +982,22 @@ async def send_post_preview(message: types.Message, state: FSMContext):
             elif t == "document":
                 media.append(InputMediaDocument(media=fid))
         if media:
+            if not post_kb and (text or entities):
+                try:
+                    media[0].caption = text
+                    if entities:
+                        media[0].caption_entities = entities
+                except Exception:
+                    pass
             await bot.send_media_group(chat_id=message.chat.id, media=media)
-        if text or post_kb or warn_lines:
-            extra = ("\n"+"\n".join(warn_lines)) if warn_lines else ""
-            await bot.send_message(chat_id=message.chat.id, text=(text or "Предпросмотр медиагруппы")+extra, entities=entities, reply_markup=post_kb)
+        if post_kb or warn_lines:
+            extra_text = None
+            if post_kb:
+                extra_text = text or "Кнопки к медиагруппе будут отдельным сообщением"
+            if warn_lines:
+                extra_text = (extra_text+"\n" if extra_text else "") + "\n".join(warn_lines)
+            if extra_text:
+                await bot.send_message(chat_id=message.chat.id, text=extra_text, entities=None, reply_markup=post_kb)
     elif media_type == "photo":
         await bot.send_photo(chat_id=message.chat.id, photo=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
     elif media_type == "video":
