@@ -140,7 +140,10 @@ async def cb_open_channel(cq: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("cycle_settings:"))
 async def cb_cycle_settings(cq: types.CallbackQuery):
-    ch_id = int(cq.data.split(":",1)[1])
+    # Поддержим вызов как с data вида "cycle_settings:{ch_id}", так и прямой вызов
+    # из других хэндлеров с данными вида "set_weeks:{ch_id}:{weeks}" / "reset_cycle_start:{ch_id}"
+    payload = cq.data.split(":", 1)[1]
+    ch_id = int(payload.split(":", 1)[0])
     async with AsyncSessionLocal() as session:
         res = await session.execute(select(Channel).where(Channel.id==ch_id))
         ch = res.scalar_one_or_none()
