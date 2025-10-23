@@ -125,22 +125,22 @@ async def _send_post_async(post_id: int):
                         except Exception:
                             pass
                     await bot.send_media_group(chat_id=ch.chat_id, media=media)
-                # Если кнопки есть — отправим текст отдельно с кнопками (ограничение Telegram)
-                if kb and p.text:
-                    await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
-                elif p.media_type == "photo":
-                    await bot.send_photo(chat_id=ch.chat_id, photo=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-                elif p.media_type == "video":
-                    await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-                elif p.media_type == "document":
-                    await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-                elif p.media_type == "voice":
-                    await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-                elif p.media_type == "video_note":
-                    # кружок: без caption и без кнопок
-                    await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
-                else:
-                    await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
+                    # Если кнопки есть — отправим текст отдельно с кнопками (ограничение Telegram)
+                    if kb and p.text:
+                        await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "photo":
+                await bot.send_photo(chat_id=ch.chat_id, photo=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "video":
+                await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "document":
+                await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "voice":
+                await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
+            elif p.media_type == "video_note":
+                # кружок: без caption и без кнопок
+                await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
+            else:
+                await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
             # success: compute next_run по МСК
             next_run = None
             if p.week_in_cycle is not None and p.weekday is not None and p.time_text:

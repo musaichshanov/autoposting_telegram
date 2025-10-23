@@ -141,7 +141,7 @@ async def cb_open_channel(cq: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data and c.data.startswith("cycle_settings:"))
 async def cb_cycle_settings(cq: types.CallbackQuery):
     # Поддержим вызов как с data вида "cycle_settings:{ch_id}", так и прямой вызов
-    # из других хэндлеров с данными вида "set_weeks:{ch_id}:{weeks}" / "reset_cycle_start:{ch_id}"
+    # из других хэндлеров с данными вида "set_weeks:{ch_id}:{weeks}" / "set_current_week:{ch_id}:{week}"
     payload = cq.data.split(":", 1)[1]
     ch_id = int(payload.split(":", 1)[0])
     async with AsyncSessionLocal() as session:
@@ -154,14 +154,45 @@ async def cb_cycle_settings(cq: types.CallbackQuery):
         if ch.owner_id != cq.from_user.id:
             await cq.answer("Изменять цикл может только владелец", show_alert=True)
             return
+        
+        # Вычисляем текущую неделю цикла для отображения
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        weeks_from_start = int((now_utc.date() - ch.cycle_start.date()).days // 7)
+        current_week_num = (weeks_from_start % ch.cycle_weeks) + 1  # 1-based для UI
+        
+        rows = [
+            [InlineKeyboardButton(text="📏 Длина цикла", callback_data=f"choose_cycle_length:{ch_id}")],
+            [InlineKeyboardButton(text="📍 Текущая неделя", callback_data=f"choose_current_week:{ch_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")],
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        text = f"⚙️ Настройки цикла\n\n" \
+               f"Длина цикла: {ch.cycle_weeks} недель\n" \
+               f"Текущая неделя: {current_week_num}/{ch.cycle_weeks}"
+        await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("choose_cycle_length:"))
+async def cb_choose_cycle_length(cq: types.CallbackQuery):
+    ch_id = int(cq.data.split(":", 1)[1])
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(Channel).where(Channel.id==ch_id))
+        ch = res.scalar_one_or_none()
+        if not ch:
+            await cq.answer("Канал не найден", show_alert=True)
+            return
+        if ch.owner_id != cq.from_user.id:
+            await cq.answer("Изменять цикл может только владелец", show_alert=True)
+            return
         rows = []
         for i in range(1, 9):
             mark = " ✅" if ch.cycle_weeks == i else ""
             rows.append([InlineKeyboardButton(text=f"{i} недель{mark}", callback_data=f"set_weeks:{ch_id}:{i}")])
-        rows.append([InlineKeyboardButton(text="Сбросить старт цикла на сегодня", callback_data=f"reset_cycle_start:{ch_id}")])
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")])
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cycle_settings:{ch_id}")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await cq.message.edit_text(f"Настройки цикла (сейчас {ch.cycle_weeks} недель):", reply_markup=kb)
+        await cq.message.edit_text("Выбери длину цикла:", reply_markup=kb)
     await cq.answer()
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("set_weeks:"))
@@ -179,12 +210,14 @@ async def cb_set_weeks(cq: types.CallbackQuery):
             return
         ch.cycle_weeks = max(1, min(weeks, 52))
         await session.commit()
-    await cq.answer("Сохранено")
+    await cq.answer("✅ Длина цикла сохранена")
+    # Вернуться в главное меню настроек цикла
+    cq.data = f"cycle_settings:{ch_id}"
     await cb_cycle_settings(cq)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("reset_cycle_start:"))
-async def cb_reset_cycle_start(cq: types.CallbackQuery):
-    ch_id = int(cq.data.split(":",1)[1])
+@dp.callback_query(lambda c: c.data and c.data.startswith("choose_current_week:"))
+async def cb_choose_current_week(cq: types.CallbackQuery):
+    ch_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
         res = await session.execute(select(Channel).where(Channel.id==ch_id))
         ch = res.scalar_one_or_none()
@@ -194,10 +227,62 @@ async def cb_reset_cycle_start(cq: types.CallbackQuery):
         if ch.owner_id != cq.from_user.id:
             await cq.answer("Изменять цикл может только владелец", show_alert=True)
             return
+        
+        # Вычисляем текущую неделю для подсветки
         from datetime import datetime
-        ch.cycle_start = datetime.utcnow()
+        from zoneinfo import ZoneInfo
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        weeks_from_start = int((now_utc.date() - ch.cycle_start.date()).days // 7)
+        current_week_num = (weeks_from_start % ch.cycle_weeks) + 1
+        
+        rows = []
+        for i in range(1, ch.cycle_weeks + 1):
+            mark = " ✅" if i == current_week_num else ""
+            rows.append([InlineKeyboardButton(text=f"Неделя {i}{mark}", callback_data=f"set_current_week:{ch_id}:{i}")])
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cycle_settings:{ch_id}")])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        await cq.message.edit_text(
+            f"Выбери, какая неделя идёт СЕЙЧАС:\n\n"
+            f"(Текущая: неделя {current_week_num})",
+            reply_markup=kb
+        )
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("set_current_week:"))
+async def cb_set_current_week(cq: types.CallbackQuery):
+    _, ch_id_str, week_str = cq.data.split(":", 2)
+    ch_id, target_week = int(ch_id_str), int(week_str)
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(Channel).where(Channel.id==ch_id))
+        ch = res.scalar_one_or_none()
+        if not ch:
+            await cq.answer("Канал не найден", show_alert=True)
+            return
+        if ch.owner_id != cq.from_user.id:
+            await cq.answer("Изменять цикл может только владелец", show_alert=True)
+            return
+        
+        # Пересчитываем cycle_start так, чтобы СЕЙЧАС была выбранная неделя
+        # Формула: cycle_start = now - (target_week - 1) * 7 дней
+        # где target_week — 1-based (1, 2, 3, ...)
+        # в БД week_in_cycle 0-based (0, 1, 2, ...), поэтому (target_week - 1)
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        
+        # Вычисляем начало текущей недели (понедельник)
+        days_since_monday = now_utc.weekday()  # 0=Пн, 6=Вс
+        start_of_current_week = now_utc - timedelta(days=days_since_monday)
+        
+        # Отступаем назад на (target_week - 1) недель от начала текущей недели
+        new_cycle_start = start_of_current_week - timedelta(weeks=(target_week - 1))
+        
+        ch.cycle_start = new_cycle_start.replace(hour=0, minute=0, second=0, microsecond=0)
         await session.commit()
-    await cq.answer("Старт цикла сброшен на сегодня")
+    
+    await cq.answer(f"✅ Установлено: сейчас неделя {target_week}")
+    # Вернуться в главное меню настроек цикла
+    cq.data = f"cycle_settings:{ch_id}"
     await cb_cycle_settings(cq)
 
 # Подтверждение удаления
