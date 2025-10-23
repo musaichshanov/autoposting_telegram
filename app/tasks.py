@@ -103,27 +103,38 @@ async def _send_post_async(post_id: int):
             # Медиагруппа: если есть кнопки, текст отправим отдельно; если кнопок нет, текст кладём как caption первого элемента
             if p.media_group:
                 media = []
-                for it in p.media_group:
+                # Определяем, нужно ли добавить caption к первому элементу
+                add_caption_to_first = not kb and (p.text or entities)
+                
+                for idx, it in enumerate(p.media_group):
                     t = it.get("type")
                     fid = it.get("file_id")
-                    if t == "photo":
-                        media.append(InputMediaPhoto(media=fid))
-                    elif t == "video":
-                        media.append(InputMediaVideo(media=fid))
-                    elif t == "document":
-                        media.append(InputMediaDocument(media=fid))
+                    
+                    # Для первого элемента добавляем caption при создании, если нужно
+                    if idx == 0 and add_caption_to_first:
+                        if entities:
+                            if t == "photo":
+                                media.append(InputMediaPhoto(media=fid, caption=p.text, caption_entities=entities))
+                            elif t == "video":
+                                media.append(InputMediaVideo(media=fid, caption=p.text, caption_entities=entities))
+                            elif t == "document":
+                                media.append(InputMediaDocument(media=fid, caption=p.text, caption_entities=entities))
+                        else:
+                            if t == "photo":
+                                media.append(InputMediaPhoto(media=fid, caption=p.text, parse_mode=pm))
+                            elif t == "video":
+                                media.append(InputMediaVideo(media=fid, caption=p.text, parse_mode=pm))
+                            elif t == "document":
+                                media.append(InputMediaDocument(media=fid, caption=p.text, parse_mode=pm))
+                    else:
+                        if t == "photo":
+                            media.append(InputMediaPhoto(media=fid))
+                        elif t == "video":
+                            media.append(InputMediaVideo(media=fid))
+                        elif t == "document":
+                            media.append(InputMediaDocument(media=fid))
+                
                 if media:
-                    # если нет кнопок, перенесём текст в caption первого элемента
-                    if not kb and (p.text or entities):
-                        try:
-                            media[0].caption = p.text
-                            # Aiogram InputMedia* поддерживает и caption_entities и parse_mode
-                            if entities:
-                                media[0].caption_entities = entities
-                            else:
-                                media[0].parse_mode = pm
-                        except Exception:
-                            pass
                     await bot.send_media_group(chat_id=ch.chat_id, media=media)
                     # Если кнопки есть — отправим текст отдельно с кнопками (ограничение Telegram)
                     if kb and p.text:

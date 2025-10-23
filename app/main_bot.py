@@ -1062,24 +1062,31 @@ async def send_post_preview(message: types.Message, state: FSMContext):
     if media_group:
         from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
         media = []
-        for it in media_group:
+        
+        # Если НЕТ кнопок, добавляем текст как caption к первому элементу при создании
+        add_caption_to_first = not post_kb and (text or entities)
+        
+        for idx, it in enumerate(media_group):
             t = it.get("type")
             fid = it.get("file_id")
-            if t == "photo":
-                media.append(InputMediaPhoto(media=fid))
-            elif t == "video":
-                media.append(InputMediaVideo(media=fid))
-            elif t == "document":
-                media.append(InputMediaDocument(media=fid))
+            
+            # Для первого элемента добавляем caption, если нужно
+            if idx == 0 and add_caption_to_first:
+                if t == "photo":
+                    media.append(InputMediaPhoto(media=fid, caption=text, caption_entities=entities))
+                elif t == "video":
+                    media.append(InputMediaVideo(media=fid, caption=text, caption_entities=entities))
+                elif t == "document":
+                    media.append(InputMediaDocument(media=fid, caption=text, caption_entities=entities))
+            else:
+                if t == "photo":
+                    media.append(InputMediaPhoto(media=fid))
+                elif t == "video":
+                    media.append(InputMediaVideo(media=fid))
+                elif t == "document":
+                    media.append(InputMediaDocument(media=fid))
+        
         if media:
-            # Если НЕТ кнопок, добавляем текст как caption к первому элементу
-            if not post_kb and (text or entities):
-                try:
-                    media[0].caption = text
-                    if entities:
-                        media[0].caption_entities = entities
-                except Exception:
-                    pass
             await bot.send_media_group(chat_id=message.chat.id, media=media)
             # Если ЕСТЬ кнопки или предупреждения, отправляем текст отдельным сообщением
             if post_kb or warn_lines:
