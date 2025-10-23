@@ -880,14 +880,16 @@ async def np_buttons_menu(cq: types.CallbackQuery, state: FSMContext):
     if cq.data == "np_btn_add":
         await state.set_state(NewPost.input_button)
         await cq.message.edit_text("Пришли текст кнопки и ссылку через перенос строки:\nТекст\nhttps://example.com")
+        await cq.answer()
     elif cq.data == "np_btn_clear":
         await state.update_data(buttons=[])
         await cq.message.edit_text("Кнопки очищены. Можно добавить новые или продолжить.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")],[InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")]]))
+        await cq.answer()
     else:
         # Готово — показываем предпросмотр перед сохранением
+        await cq.answer()
         await state.set_state(NewPost.preview)
         await send_post_preview(cq.message, state)
-    await cq.answer()
 
 # Если в состоянии выбора кнопок пользователь прислал текст, а не нажал inline — повторно показываем меню
 @dp.message(StateFilter(NewPost.ask_button))
@@ -1070,6 +1072,7 @@ async def send_post_preview(message: types.Message, state: FSMContext):
             elif t == "document":
                 media.append(InputMediaDocument(media=fid))
         if media:
+            # Если НЕТ кнопок, добавляем текст как caption к первому элементу
             if not post_kb and (text or entities):
                 try:
                     media[0].caption = text
@@ -1078,14 +1081,16 @@ async def send_post_preview(message: types.Message, state: FSMContext):
                 except Exception:
                     pass
             await bot.send_media_group(chat_id=message.chat.id, media=media)
-        if post_kb or warn_lines:
-            extra_text = None
-            if post_kb:
-                extra_text = text or "Кнопки к медиагруппе будут отдельным сообщением"
-            if warn_lines:
-                extra_text = (extra_text+"\n" if extra_text else "") + "\n".join(warn_lines)
-            if extra_text:
-                await bot.send_message(chat_id=message.chat.id, text=extra_text, entities=None, reply_markup=post_kb)
+            # Если ЕСТЬ кнопки или предупреждения, отправляем текст отдельным сообщением
+            if post_kb or warn_lines:
+                extra_text = None
+                if post_kb and text:
+                    extra_text = text
+                elif warn_lines:
+                    extra_text = "\n".join(warn_lines)
+                if extra_text:
+                    # Сохраняем entities, если есть
+                    await bot.send_message(chat_id=message.chat.id, text=extra_text, entities=entities if post_kb else None, reply_markup=post_kb)
     elif media_type == "photo":
         await bot.send_photo(chat_id=message.chat.id, photo=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
     elif media_type == "video":
