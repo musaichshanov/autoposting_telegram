@@ -542,21 +542,31 @@ async def np_choose_channel(cq: types.CallbackQuery, state: FSMContext):
 async def np_choose_week(cq: types.CallbackQuery, state: FSMContext):
     week = int(cq.data.split(":",1)[1])
     await state.update_data(week=week)
-    # выбрать день недели с отметками существующих постов
+    # выбрать день недели с отметками существующих постов + счётчик
     weekdays = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
     data = await state.get_data()
     ch_id = data.get("ch_id")
-    existing_days = set()
+    # Считаем количество постов для каждого дня
+    posts_per_day = {}
     async with AsyncSessionLocal() as session:
         from .models import Post
-        res = await session.execute(select(Post.weekday).where(Post.channel_id==ch_id, Post.week_in_cycle==week))
-        for (wd,) in res.all():
+        from sqlalchemy import func
+        res = await session.execute(
+            select(Post.weekday, func.count(Post.id))
+            .where(Post.channel_id==ch_id, Post.week_in_cycle==week)
+            .group_by(Post.weekday)
+        )
+        for wd, cnt in res.all():
             if wd is not None:
-                existing_days.add(int(wd))
+                posts_per_day[int(wd)] = cnt
     rows = []
     for i in range(7):
-        mark = " •" if i in existing_days else ""
-        rows.append([InlineKeyboardButton(text=f"{weekdays[i]}{mark}", callback_data=f"np_wd:{i}")])
+        cnt = posts_per_day.get(i, 0)
+        if cnt > 0:
+            label = f"{weekdays[i]} ({cnt})"
+        else:
+            label = weekdays[i]
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"np_wd:{i}")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="⬅️ Недели", callback_data="new_post")]])
     await state.set_state(NewPost.choose_weekday)
     await cq.message.edit_text("Выбери день недели:", reply_markup=kb)
@@ -1165,7 +1175,33 @@ async def render_day_posts_menu(message: types.Message, ch_id: int, week: int, w
     if posts:
         rows = []
         for idx, p in enumerate(posts, start=1):
-            rows.append([InlineKeyboardButton(text=f"Пост {idx}", callback_data=f"np_view:{p.id}")])
+            # Формируем превью: время + первые слова текста
+            preview_parts = []
+            if p.time_text:
+                preview_parts.append(p.time_text)
+            if p.text:
+                # Берём первые 20 символов текста
+                text_preview = p.text[:20].replace("\n", " ")
+                if len(p.text) > 20:
+                    text_preview += "..."
+                preview_parts.append(text_preview)
+            elif p.media_type:
+                # Если текста нет, покажем тип медиа
+                media_labels = {
+                    "photo": "📷",
+                    "video": "🎬",
+                    "document": "📄",
+                    "voice": "🎤",
+                    "video_note": "⭕️"
+                }
+                if p.media_group:
+                    preview_parts.append("🖼 Альбом")
+                else:
+                    preview_parts.append(media_labels.get(p.media_type, "📎"))
+            
+            preview = " - ".join(preview_parts) if preview_parts else ""
+            button_text = f"Пост {idx} - {preview}" if preview else f"Пост {idx}"
+            rows.append([InlineKeyboardButton(text=button_text, callback_data=f"np_view:{p.id}")])
         rows.append([InlineKeyboardButton(text="➕ Добавить пост", callback_data=f"np_add:{wd}")])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_week:{week}")])
         await safe_edit_message_text(message, f"{weekdays[wd]}: выбери пост или добавь новый", InlineKeyboardMarkup(inline_keyboard=rows))
