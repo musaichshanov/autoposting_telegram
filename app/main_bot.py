@@ -209,6 +209,38 @@ async def cb_set_weeks(cq: types.CallbackQuery):
             await cq.answer("Изменять цикл может только владелец", show_alert=True)
             return
         ch.cycle_weeks = max(1, min(weeks, 52))
+        
+        # ВАЖНО: Пересчитываем next_run для всех постов канала с новой длиной цикла
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from .models import Post
+        from .utils import compute_next_run_cycle_tz
+        from datetime import time as dtime
+        
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        posts_res = await session.execute(
+            select(Post).where(
+                Post.channel_id == ch_id,
+                Post.week_in_cycle != None,
+                Post.weekday != None,
+                Post.time_text != None
+            )
+        )
+        posts = posts_res.scalars().all()
+        
+        for p in posts:
+            hh, mm = map(int, p.time_text.split(":"))
+            new_next_run = compute_next_run_cycle_tz(
+                now_utc=now_utc,
+                cycle_weeks=ch.cycle_weeks,
+                cycle_start_utc=ch.cycle_start if ch.cycle_start.tzinfo else ch.cycle_start.replace(tzinfo=ZoneInfo("UTC")),
+                week_in_cycle=p.week_in_cycle,
+                weekday=p.weekday,
+                t_local=dtime(hh, mm),
+                tz_name="Europe/Moscow"
+            )
+            p.next_run = new_next_run
+        
         await session.commit()
     await cq.answer("✅ Длина цикла сохранена")
     # Вернуться в главное меню настроек цикла
@@ -278,6 +310,35 @@ async def cb_set_current_week(cq: types.CallbackQuery):
         new_cycle_start = start_of_current_week - timedelta(weeks=(target_week - 1))
         
         ch.cycle_start = new_cycle_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # ВАЖНО: Пересчитываем next_run для всех постов канала с новым cycle_start
+        from .models import Post
+        from .utils import compute_next_run_cycle_tz
+        from datetime import time as dtime
+        
+        posts_res = await session.execute(
+            select(Post).where(
+                Post.channel_id == ch_id,
+                Post.week_in_cycle != None,
+                Post.weekday != None,
+                Post.time_text != None
+            )
+        )
+        posts = posts_res.scalars().all()
+        
+        for p in posts:
+            hh, mm = map(int, p.time_text.split(":"))
+            new_next_run = compute_next_run_cycle_tz(
+                now_utc=now_utc,
+                cycle_weeks=ch.cycle_weeks or 1,
+                cycle_start_utc=ch.cycle_start,
+                week_in_cycle=p.week_in_cycle,
+                weekday=p.weekday,
+                t_local=dtime(hh, mm),
+                tz_name="Europe/Moscow"
+            )
+            p.next_run = new_next_run
+        
         await session.commit()
     
     await cq.answer(f"✅ Установлено: сейчас неделя {target_week}")
