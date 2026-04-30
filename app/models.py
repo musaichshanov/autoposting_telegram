@@ -49,6 +49,9 @@ class Post(Base):
     week_in_cycle = Column(Integer, nullable=True) # 0..cycle_weeks-1
     parse_mode = Column(String(20), nullable=True)  # 'HTML', 'MarkdownV2', or None
     text_entities = Column(JSONB, nullable=True)  # Telegram entities for text/caption
+    src_chat_id = Column(BigInteger, nullable=True)  # для copy_message: chat_id исходного сообщения
+    src_message_id = Column(BigInteger, nullable=True)  # для copy_message: message_id исходного сообщения
+    src_message_ids = Column(JSONB, nullable=True)  # для copy_messages: список message_id альбома
     created_by = Column(BigInteger, nullable=False) # telegram_id of creator
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_status = Column(String(100), nullable=True)

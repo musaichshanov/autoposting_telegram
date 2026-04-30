@@ -36,6 +36,17 @@ def compute_next_run_cycle(now: datetime, cycle_weeks: int, cycle_start: datetim
     days_ahead = (weekday - base.weekday()) % 7
     return datetime.combine((base + timedelta(days=days_ahead)).date(), t)
 
+def compute_next_weekday_time_tz(now_utc: datetime, weekday: int, t_local: time, tz_name: str = "Europe/Moscow") -> datetime:
+    """Ближайший указанный день недели и время в локальной зоне, возвращается в UTC."""
+    tz = ZoneInfo(tz_name)
+    now_local = now_utc.astimezone(tz) if now_utc.tzinfo else now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+    days_ahead = (weekday - now_local.weekday()) % 7
+    candidate_date = (now_local + timedelta(days=days_ahead)).date()
+    candidate_local = datetime.combine(candidate_date, t_local).replace(tzinfo=tz)
+    if candidate_local <= now_local:
+        candidate_local = candidate_local + timedelta(days=7)
+    return candidate_local.astimezone(ZoneInfo("UTC"))
+
 def compute_next_run_cycle_tz(now_utc: datetime, cycle_weeks: int, cycle_start_utc: datetime, week_in_cycle: int, weekday: int, t_local: time, tz_name: str = "Europe/Moscow") -> datetime:
     tz = ZoneInfo(tz_name)
     # привести now и start к локальному времени

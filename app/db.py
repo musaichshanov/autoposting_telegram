@@ -19,10 +19,14 @@ AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSes
 
 # Создание схемы БД при старте
 from app.models import Base  # импорт после создания engine, чтобы избежать циклов
+from sqlalchemy import text
 
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS src_chat_id BIGINT"))
+        await conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS src_message_id BIGINT"))
+        await conn.execute(text("ALTER TABLE posts ADD COLUMN IF NOT EXISTS src_message_ids JSONB"))
 
 # dependency for FastAPI
 async def get_session():

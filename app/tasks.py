@@ -8,8 +8,7 @@ from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 import os
 import asyncio
 from sqlalchemy.future import select
-from datetime import datetime, time
-from .utils import compute_next_run_cycle_tz
+from datetime import datetime
 from sqlalchemy import update, and_
 from zoneinfo import ZoneInfo
 from celery.utils.log import get_task_logger
@@ -80,7 +79,7 @@ async def _send_post_async(post_id: int):
                             rows.append([InlineKeyboardButton(text=t, url=u)])
                 except Exception:
                     rows = []
-            # добавим одиночную кнопку (если задана) в конец, чтобы не ломать старые посты
+            # legacy: одиночная кнопка
             if p.button_text and p.button_url:
                 rows.append([InlineKeyboardButton(text=p.button_text, url=p.button_url)])
             if rows:
@@ -100,17 +99,30 @@ async def _send_post_async(post_id: int):
                     return "MarkdownV2"
                 return None
             pm = None if entities else detect_parse_mode(p.text)
-            # Медиагруппа: если есть кнопки, текст отправим отдельно; если кнопок нет, текст кладём как caption первого элемента
-            if p.media_group:
+
+            # 1) copy_messages — альбом, скопированный из исходного чата (сохраняет premium emoji)
+            if p.src_chat_id and p.src_message_ids:
+                ids = list(p.src_message_ids)
+                await bot.copy_messages(chat_id=ch.chat_id, from_chat_id=p.src_chat_id, message_ids=ids)
+                if kb:
+                    # отдельным сообщением кнопки + текст (если есть)
+                    btn_text = p.text or "⬇️"
+                    await bot.send_message(chat_id=ch.chat_id, text=btn_text, entities=entities, parse_mode=pm, reply_markup=kb)
+            # 2) copy_message — одиночное сообщение из исходного чата
+            elif p.src_chat_id and p.src_message_id:
+                await bot.copy_message(
+                    chat_id=ch.chat_id,
+                    from_chat_id=p.src_chat_id,
+                    message_id=p.src_message_id,
+                    reply_markup=kb,
+                )
+            # 3) legacy fallback — отправка по сохранённому file_id
+            elif p.media_group:
                 media = []
-                # Определяем, нужно ли добавить caption к первому элементу
                 add_caption_to_first = not kb and (p.text or entities)
-                
                 for idx, it in enumerate(p.media_group):
                     t = it.get("type")
                     fid = it.get("file_id")
-                    
-                    # Для первого элемента добавляем caption при создании, если нужно
                     if idx == 0 and add_caption_to_first:
                         if entities:
                             if t == "photo":
@@ -133,10 +145,8 @@ async def _send_post_async(post_id: int):
                             media.append(InputMediaVideo(media=fid))
                         elif t == "document":
                             media.append(InputMediaDocument(media=fid))
-                
                 if media:
                     await bot.send_media_group(chat_id=ch.chat_id, media=media)
-                    # Если кнопки есть — отправим текст отдельно с кнопками (ограничение Telegram)
                     if kb and p.text:
                         await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
             elif p.media_type == "photo":
@@ -148,28 +158,16 @@ async def _send_post_async(post_id: int):
             elif p.media_type == "voice":
                 await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
             elif p.media_type == "video_note":
-                # кружок: без caption и без кнопок
                 await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
             else:
                 await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
-            # success: compute next_run по МСК
-            next_run = None
-            if p.week_in_cycle is not None and p.weekday is not None and p.time_text:
-                hh, mm = map(int, p.time_text.split(":"))
-                next_run = compute_next_run_cycle_tz(
-                    now_utc=now_utc,
-                    cycle_weeks=ch.cycle_weeks or 1,
-                    cycle_start_utc=ch.cycle_start if ch.cycle_start.tzinfo else ch.cycle_start.replace(tzinfo=ZoneInfo("UTC")),
-                    week_in_cycle=p.week_in_cycle,
-                    weekday=p.weekday,
-                    t_local=time(hh, mm),
-                    tz_name="Europe/Moscow",
-                )
+
+            # success: пост одноразовый — next_run сбрасываем
             await session.execute(
-                update(Post).where(Post.id == p.id).values(last_status="ok", next_run=next_run)
+                update(Post).where(Post.id == p.id).values(last_status="ok", next_run=None)
             )
             await session.commit()
-            logger.info(f"send_post: sent post {p.id} to chat {ch.chat_id}, next_run={next_run}")
+            logger.info(f"send_post: sent post {p.id} to chat {ch.chat_id} (one-shot)")
             return {"ok": True, "post_id": p.id}
         except Exception as e:
             await session.execute(

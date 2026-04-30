@@ -3,7 +3,8 @@ import os
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, StateFilter
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
+from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -12,9 +13,8 @@ from dotenv import load_dotenv
 from app.db import AsyncSessionLocal, init_db
 from app.models import User, Channel, ChannelAdmin, Post
 from sqlalchemy.future import select
-from sqlalchemy import insert
-from datetime import datetime, time, timedelta
-from app.utils import compute_next_run_from_weekday_and_time
+from datetime import datetime, time as dtime, timedelta
+from app.utils import compute_next_weekday_time_tz
 from zoneinfo import ZoneInfo
 
 load_dotenv()
@@ -22,8 +22,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage())
 
-# Helpers
-MAIN_TEXT = "Привет! Я бот автопостинга. Авторизация через Telegram — ты уже в системе."
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+WEEKDAYS_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+
+MAIN_TEXT = "Привет! Я бот автопостинга."
+
+# ---------- общие хелперы ----------
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -39,7 +43,7 @@ async def safe_edit_message_text(msg: types.Message, text: str, kb: InlineKeyboa
     try:
         await msg.edit_text(text, reply_markup=kb)
     except TelegramBadRequest:
-        sent = await bot.send_message(chat_id=msg.chat.id, text=text, reply_markup=kb)
+        await bot.send_message(chat_id=msg.chat.id, text=text, reply_markup=kb)
         try:
             await msg.delete()
         except Exception:
@@ -47,22 +51,19 @@ async def safe_edit_message_text(msg: types.Message, text: str, kb: InlineKeyboa
 
 class NewPost(StatesGroup):
     choose_channel = State()
-    choose_week = State()
     choose_weekday = State()
     choose_time = State()
-    input_text = State()
-    input_media = State()
+    input_content = State()
     ask_button = State()
     input_button = State()
-    choose_parse = State()
     preview = State()
 
 class ManageAdmins(StatesGroup):
     wait_input = State()
 
-async def ensure_user(telegram_id:int, name:str=None):
+async def ensure_user(telegram_id: int, name: str = None):
     async with AsyncSessionLocal() as session:
-        q = await session.execute(select(User).where(User.telegram_id==telegram_id))
+        q = await session.execute(select(User).where(User.telegram_id == telegram_id))
         u = q.scalar_one_or_none()
         if not u:
             u = User(telegram_id=telegram_id, name=name)
@@ -70,24 +71,30 @@ async def ensure_user(telegram_id:int, name:str=None):
             await session.commit()
         return u
 
+# ---------- /start, главное меню ----------
+
 @dp.message(Command(commands=["start"]))
 async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await ensure_user(message.from_user.id, message.from_user.full_name)
     await message.answer(MAIN_TEXT, reply_markup=main_menu_kb())
 
-@dp.callback_query(lambda c: c.data=="back_start")
-async def cb_back_start(cq: types.CallbackQuery):
-    await cq.message.edit_text(MAIN_TEXT, reply_markup=main_menu_kb())
+@dp.callback_query(lambda c: c.data == "back_start")
+async def cb_back_start(cq: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_message_text(cq.message, MAIN_TEXT, main_menu_kb())
     await cq.answer()
 
-# Добавление канала (пересланное сообщение или @username)
-@dp.callback_query(lambda c: c.data=="add_channel")
+# ---------- добавление канала ----------
+
+@dp.callback_query(lambda c: c.data == "add_channel")
 async def cb_add_channel(cq: types.CallbackQuery):
     await cq.message.answer("Перешли сообщение из канала (бот должен быть админом) или введи @username канала.")
     await cq.answer()
 
-# Мои каналы — показать список каналов кнопками
-@dp.callback_query(lambda c: c.data=="my_channels")
+# ---------- мои каналы ----------
+
+@dp.callback_query(lambda c: c.data == "my_channels")
 async def cb_my_channels(cq: types.CallbackQuery):
     await ensure_user(cq.from_user.id, cq.from_user.full_name)
     async with AsyncSessionLocal() as session:
@@ -104,22 +111,16 @@ async def cb_my_channels(cq: types.CallbackQuery):
                 seen_ids.add(ch.id)
                 channels.append(ch)
         if not channels:
-            await cq.message.edit_text("У тебя пока нет каналов. Нажми ‘Добавить канал’.", reply_markup=main_menu_kb())
+            await safe_edit_message_text(cq.message, "У тебя пока нет каналов. Нажми ‘Добавить канал’.", main_menu_kb())
         else:
-            rows = []
-            for ch in channels:
-                title = channel_display_name(ch)
-                rows.append([InlineKeyboardButton(text=title, callback_data=f"open_channel:{ch.id}")])
+            rows = [[InlineKeyboardButton(text=channel_display_name(ch), callback_data=f"open_channel:{ch.id}")] for ch in channels]
             rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_start")])
-            kb = InlineKeyboardMarkup(inline_keyboard=rows)
-            await cq.message.edit_text("Выбери канал:", reply_markup=kb)
+            await safe_edit_message_text(cq.message, "Выбери канал:", InlineKeyboardMarkup(inline_keyboard=rows))
     await cq.answer()
 
-# Подменю конкретного канала (+ настройки цикла)
 @dp.callback_query(lambda c: c.data and c.data.startswith("open_channel:"))
 async def cb_open_channel(cq: types.CallbackQuery):
-    _, ch_id_str = cq.data.split(":", 1)
-    ch_id = int(ch_id_str)
+    ch_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
         res = await session.execute(select(Channel).where(Channel.id == ch_id))
         ch = res.scalar_one_or_none()
@@ -127,243 +128,146 @@ async def cb_open_channel(cq: types.CallbackQuery):
             await cq.answer("Канал не найден", show_alert=True)
             return
         title = channel_display_name(ch)
-        text = (f"Канал: {title}\n"
-                f"Цикл (недели): {ch.cycle_weeks}\n")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Удалить канал", callback_data=f"confirm_del_channel:{ch.id}")],
-            [InlineKeyboardButton(text="👤 Админы", callback_data=f"manage_admins:{ch.id}")],
-            [InlineKeyboardButton(text="⚙️ Настройки цикла", callback_data=f"cycle_settings:{ch.id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_channels")],
-        ])
-        await cq.message.edit_text(text, reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Запланированные посты", callback_data=f"posts_list:{ch_id}")],
+        [InlineKeyboardButton(text="👤 Админы", callback_data=f"manage_admins:{ch_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить канал", callback_data=f"confirm_del_channel:{ch_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_channels")],
+    ])
+    await safe_edit_message_text(cq.message, f"Канал: {title}", kb)
     await cq.answer()
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("cycle_settings:"))
-async def cb_cycle_settings(cq: types.CallbackQuery):
-    # Поддержим вызов как с data вида "cycle_settings:{ch_id}", так и прямой вызов
-    # из других хэндлеров с данными вида "set_weeks:{ch_id}:{weeks}" / "set_current_week:{ch_id}:{week}"
-    payload = cq.data.split(":", 1)[1]
-    ch_id = int(payload.split(":", 1)[0])
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await cq.answer("Канал не найден", show_alert=True)
-            return
-        # только владелец может менять цикл
-        if ch.owner_id != cq.from_user.id:
-            await cq.answer("Изменять цикл может только владелец", show_alert=True)
-            return
-        
-        # Вычисляем текущую неделю цикла для отображения
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        now_utc = datetime.now(ZoneInfo("UTC"))
-        weeks_from_start = int((now_utc.date() - ch.cycle_start.date()).days // 7)
-        current_week_num = (weeks_from_start % ch.cycle_weeks) + 1  # 1-based для UI
-        
-        rows = [
-            [InlineKeyboardButton(text="📏 Длина цикла", callback_data=f"choose_cycle_length:{ch_id}")],
-            [InlineKeyboardButton(text="📍 Текущая неделя", callback_data=f"choose_current_week:{ch_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")],
-        ]
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        text = f"⚙️ Настройки цикла\n\n" \
-               f"Длина цикла: {ch.cycle_weeks} недель\n" \
-               f"Текущая неделя: {current_week_num}/{ch.cycle_weeks}"
-        await cq.message.edit_text(text, reply_markup=kb)
-    await cq.answer()
+# ---------- список запланированных постов ----------
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("choose_cycle_length:"))
-async def cb_choose_cycle_length(cq: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data and c.data.startswith("posts_list:"))
+async def cb_posts_list(cq: types.CallbackQuery):
     ch_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await cq.answer("Канал не найден", show_alert=True)
-            return
-        if ch.owner_id != cq.from_user.id:
-            await cq.answer("Изменять цикл может только владелец", show_alert=True)
-            return
-        rows = []
-        for i in range(1, 9):
-            mark = " ✅" if ch.cycle_weeks == i else ""
-            rows.append([InlineKeyboardButton(text=f"{i} недель{mark}", callback_data=f"set_weeks:{ch_id}:{i}")])
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cycle_settings:{ch_id}")])
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await cq.message.edit_text("Выбери длину цикла:", reply_markup=kb)
+        res = await session.execute(
+            select(Post).where(Post.channel_id == ch_id, Post.next_run != None).order_by(Post.next_run.asc())
+        )
+        posts = res.scalars().all()
+    if not posts:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")]])
+        await safe_edit_message_text(cq.message, "Запланированных постов пока нет.", kb)
+        await cq.answer()
+        return
+    rows = []
+    for p in posts:
+        wd = WEEKDAYS[p.weekday] if p.weekday is not None else "?"
+        t = p.time_text or "?"
+        prev = (p.text or "").replace("\n", " ")[:25]
+        label = f"{wd} {t}" + (f" — {prev}" if prev else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"post_view:{p.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")])
+    await safe_edit_message_text(cq.message, "Запланированные посты:", InlineKeyboardMarkup(inline_keyboard=rows))
     await cq.answer()
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("set_weeks:"))
-async def cb_set_weeks(cq: types.CallbackQuery):
-    _, ch_id_str, weeks_str = cq.data.split(":", 2)
-    ch_id, weeks = int(ch_id_str), int(weeks_str)
+@dp.callback_query(lambda c: c.data and c.data.startswith("post_view:"))
+async def cb_post_view(cq: types.CallbackQuery):
+    post_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await cq.answer("Канал не найден", show_alert=True)
-            return
-        if ch.owner_id != cq.from_user.id:
-            await cq.answer("Изменять цикл может только владелец", show_alert=True)
-            return
-        ch.cycle_weeks = max(1, min(weeks, 52))
-        
-        # ВАЖНО: Пересчитываем next_run для всех постов канала с новой длиной цикла
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        from .models import Post
-        from .utils import compute_next_run_cycle_tz
-        from datetime import time as dtime
-        
-        now_utc = datetime.now(ZoneInfo("UTC"))
-        posts_res = await session.execute(
-            select(Post).where(
-                Post.channel_id == ch_id,
-                Post.week_in_cycle != None,
-                Post.weekday != None,
-                Post.time_text != None
-            )
-        )
-        posts = posts_res.scalars().all()
-        
-        for p in posts:
-            hh, mm = map(int, p.time_text.split(":"))
-            new_next_run = compute_next_run_cycle_tz(
-                now_utc=now_utc,
-                cycle_weeks=ch.cycle_weeks,
-                cycle_start_utc=ch.cycle_start if ch.cycle_start.tzinfo else ch.cycle_start.replace(tzinfo=ZoneInfo("UTC")),
-                week_in_cycle=p.week_in_cycle,
-                weekday=p.weekday,
-                t_local=dtime(hh, mm),
-                tz_name="Europe/Moscow"
-            )
-            p.next_run = new_next_run
-        
-        await session.commit()
-    await cq.answer("✅ Длина цикла сохранена")
-    # Вернуться в главное меню настроек цикла
-    cq.data = f"cycle_settings:{ch_id}"
-    await cb_cycle_settings(cq)
+        res = await session.execute(select(Post).where(Post.id == post_id))
+        p = res.scalar_one_or_none()
+    if not p:
+        await cq.answer("Пост не найден", show_alert=True)
+        return
+    when = "не запланирован"
+    if p.next_run:
+        local = (p.next_run if p.next_run.tzinfo else p.next_run.replace(tzinfo=ZoneInfo("UTC"))).astimezone(ZoneInfo("Europe/Moscow"))
+        when = local.strftime("%d.%m.%Y %H:%M (МСК)")
+    wd = WEEKDAYS_FULL[p.weekday] if p.weekday is not None else "?"
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    # Превью
+    rows = []
+    if p.buttons:
+        for b in p.buttons:
+            t = (b.get("text") or "").strip()
+            u = (b.get("url") or "").strip()
+            if t and u:
+                rows.append([InlineKeyboardButton(text=t, url=u)])
+    post_kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    chat_id = cq.message.chat.id
+    if p.src_chat_id and p.src_message_ids:
+        try:
+            await bot.copy_messages(chat_id=chat_id, from_chat_id=p.src_chat_id, message_ids=list(p.src_message_ids))
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=p.text or "📸 Альбом")
+    elif p.src_chat_id and p.src_message_id:
+        try:
+            await bot.copy_message(chat_id=chat_id, from_chat_id=p.src_chat_id, message_id=p.src_message_id, reply_markup=post_kb)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=p.text or "(превью недоступно)", reply_markup=post_kb)
+    elif p.media_group:
+        media = []
+        for it in p.media_group:
+            t = it.get("type")
+            fid = it.get("file_id")
+            if t == "photo":
+                media.append(InputMediaPhoto(media=fid))
+            elif t == "video":
+                media.append(InputMediaVideo(media=fid))
+            elif t == "document":
+                media.append(InputMediaDocument(media=fid))
+        if media:
+            await bot.send_media_group(chat_id=chat_id, media=media)
+        if p.text or post_kb:
+            await bot.send_message(chat_id=chat_id, text=p.text or "⬇️", reply_markup=post_kb)
+    elif p.media_type and p.media_file_id:
+        sender = {
+            "photo": bot.send_photo,
+            "video": bot.send_video,
+            "document": bot.send_document,
+            "voice": bot.send_voice,
+        }.get(p.media_type)
+        if sender:
+            kwargs = {"chat_id": chat_id, "caption": p.text, "reply_markup": post_kb}
+            kwargs[p.media_type] = p.media_file_id
+            await sender(**kwargs)
+        else:
+            await bot.send_message(chat_id=chat_id, text=p.text or "(медиа)", reply_markup=post_kb)
+    else:
+        await bot.send_message(chat_id=chat_id, text=p.text or "(пусто)", reply_markup=post_kb)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("choose_current_week:"))
-async def cb_choose_current_week(cq: types.CallbackQuery):
-    ch_id = int(cq.data.split(":", 1)[1])
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await cq.answer("Канал не найден", show_alert=True)
-            return
-        if ch.owner_id != cq.from_user.id:
-            await cq.answer("Изменять цикл может только владелец", show_alert=True)
-            return
-        
-        # Вычисляем текущую неделю для подсветки
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        now_utc = datetime.now(ZoneInfo("UTC"))
-        weeks_from_start = int((now_utc.date() - ch.cycle_start.date()).days // 7)
-        current_week_num = (weeks_from_start % ch.cycle_weeks) + 1
-        
-        rows = []
-        for i in range(1, ch.cycle_weeks + 1):
-            mark = " ✅" if i == current_week_num else ""
-            rows.append([InlineKeyboardButton(text=f"Неделя {i}{mark}", callback_data=f"set_current_week:{ch_id}:{i}")])
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cycle_settings:{ch_id}")])
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await cq.message.edit_text(
-            f"Выбери, какая неделя идёт СЕЙЧАС:\n\n"
-            f"(Текущая: неделя {current_week_num})",
-            reply_markup=kb
-        )
+    manage = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"post_del:{p.id}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"posts_list:{p.channel_id}")],
+    ])
+    await bot.send_message(chat_id=chat_id, text=f"📅 {wd} в {p.time_text}\n⏰ Ближайшая отправка: {when}", reply_markup=manage)
     await cq.answer()
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("set_current_week:"))
-async def cb_set_current_week(cq: types.CallbackQuery):
-    _, ch_id_str, week_str = cq.data.split(":", 2)
-    ch_id, target_week = int(ch_id_str), int(week_str)
+@dp.callback_query(lambda c: c.data and c.data.startswith("post_del:"))
+async def cb_post_del(cq: types.CallbackQuery):
+    post_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await cq.answer("Канал не найден", show_alert=True)
+        res = await session.execute(select(Post).where(Post.id == post_id))
+        p = res.scalar_one_or_none()
+        if not p:
+            await cq.answer("Пост не найден", show_alert=True)
             return
-        if ch.owner_id != cq.from_user.id:
-            await cq.answer("Изменять цикл может только владелец", show_alert=True)
-            return
-        
-        # Пересчитываем cycle_start так, чтобы СЕЙЧАС была выбранная неделя
-        # Формула: cycle_start = now - (target_week - 1) * 7 дней
-        # где target_week — 1-based (1, 2, 3, ...)
-        # в БД week_in_cycle 0-based (0, 1, 2, ...), поэтому (target_week - 1)
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
-        now_utc = datetime.now(ZoneInfo("UTC"))
-        
-        # Вычисляем начало текущей недели (понедельник)
-        days_since_monday = now_utc.weekday()  # 0=Пн, 6=Вс
-        start_of_current_week = now_utc - timedelta(days=days_since_monday)
-        
-        # Отступаем назад на (target_week - 1) недель от начала текущей недели
-        new_cycle_start = start_of_current_week - timedelta(weeks=(target_week - 1))
-        
-        ch.cycle_start = new_cycle_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # ВАЖНО: Пересчитываем next_run для всех постов канала с новым cycle_start
-        from .models import Post
-        from .utils import compute_next_run_cycle_tz
-        from datetime import time as dtime
-        
-        posts_res = await session.execute(
-            select(Post).where(
-                Post.channel_id == ch_id,
-                Post.week_in_cycle != None,
-                Post.weekday != None,
-                Post.time_text != None
-            )
-        )
-        posts = posts_res.scalars().all()
-        
-        for p in posts:
-            hh, mm = map(int, p.time_text.split(":"))
-            new_next_run = compute_next_run_cycle_tz(
-                now_utc=now_utc,
-                cycle_weeks=ch.cycle_weeks or 1,
-                cycle_start_utc=ch.cycle_start,
-                week_in_cycle=p.week_in_cycle,
-                weekday=p.weekday,
-                t_local=dtime(hh, mm),
-                tz_name="Europe/Moscow"
-            )
-            p.next_run = new_next_run
-        
+        ch_id = p.channel_id
+        await session.delete(p)
         await session.commit()
-    
-    await cq.answer(f"✅ Установлено: сейчас неделя {target_week}")
-    # Вернуться в главное меню настроек цикла
-    cq.data = f"cycle_settings:{ch_id}"
-    await cb_cycle_settings(cq)
+    await cq.answer("Удалён")
+    cq.data = f"posts_list:{ch_id}"
+    await cb_posts_list(cq)
 
-# Подтверждение удаления
 @dp.callback_query(lambda c: c.data and c.data.startswith("confirm_del_channel:"))
 async def cb_confirm_delete(cq: types.CallbackQuery):
-    _, ch_id_str = cq.data.split(":", 1)
-    ch_id = int(ch_id_str)
+    ch_id = int(cq.data.split(":", 1)[1])
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delete_channel:{ch_id}")],
         [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"open_channel:{ch_id}")],
     ])
-    await cq.message.edit_text("Точно удалить канал? Это действие необратимо.", reply_markup=kb)
+    await safe_edit_message_text(cq.message, "Точно удалить канал? Это действие необратимо.", kb)
     await cq.answer()
 
-# Удаление канала владельцем
 @dp.callback_query(lambda c: c.data and (c.data.startswith("delete_channel:") or c.data.startswith("del_channel:")))
 async def cb_delete_channel(cq: types.CallbackQuery):
-    _, ch_id_str = cq.data.split(":", 1)
-    ch_id = int(ch_id_str)
-
+    ch_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
         res = await session.execute(select(Channel).where(Channel.id == ch_id))
         ch = res.scalar_one_or_none()
@@ -375,14 +279,14 @@ async def cb_delete_channel(cq: types.CallbackQuery):
             return
         await session.delete(ch)
         await session.commit()
-    await cq.message.edit_text("Канал удалён. Возврат к списку…")
+    await safe_edit_message_text(cq.message, "Канал удалён.")
     await cb_my_channels(cq)
 
-# Управление администраторами: список + кнопки
+# ---------- админы ----------
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("manage_admins:"))
 async def cb_manage_admins(cq: types.CallbackQuery, state: FSMContext):
-    _, ch_id_str = cq.data.split(":", 1)
-    ch_id = int(ch_id_str)
+    ch_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
         res = await session.execute(select(Channel).where(Channel.id == ch_id))
         ch = res.scalar_one_or_none()
@@ -392,7 +296,6 @@ async def cb_manage_admins(cq: types.CallbackQuery, state: FSMContext):
         if ch.owner_id != cq.from_user.id:
             await cq.answer("Управлять администраторами может только владелец", show_alert=True)
             return
-        # собираем список админов
         admins_res = await session.execute(select(ChannelAdmin).where(ChannelAdmin.channel_id == ch_id))
         admins = admins_res.scalars().all()
         title = channel_display_name(ch)
@@ -406,22 +309,18 @@ async def cb_manage_admins(cq: types.CallbackQuery, state: FSMContext):
             lines.append("Пока никого нет.")
         rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_admin:{ch_id}")])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")])
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        await cq.message.edit_text("\n".join(lines), reply_markup=kb)
+        await safe_edit_message_text(cq.message, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
     await cq.answer()
 
-# Кнопка Добавить администратора — просим ввод
 @dp.callback_query(lambda c: c.data and c.data.startswith("add_admin:"))
 async def cb_add_admin(cq: types.CallbackQuery, state: FSMContext):
-    _, ch_id_str = cq.data.split(":", 1)
-    ch_id = int(ch_id_str)
+    ch_id = int(cq.data.split(":", 1)[1])
     await state.set_state(ManageAdmins.wait_input)
     await state.update_data(admin_channel_id=ch_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Отмена", callback_data=f"manage_admins:{ch_id}")]])
-    await cq.message.edit_text("Пришли Telegram ID, @username или перешли сообщение от нужного пользователя.", reply_markup=kb)
+    await safe_edit_message_text(cq.message, "Пришли Telegram ID, @username или перешли сообщение от нужного пользователя.", kb)
     await cq.answer()
 
-# Приём ввода администратора в состоянии
 @dp.message(StateFilter(ManageAdmins.wait_input))
 async def on_admin_input(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -430,13 +329,9 @@ async def on_admin_input(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer("Сессия сброшена. Попробуй ещё раз.")
         return
-
-    # определяем telegram_id
     new_admin_id = None
-    # 1) пересланное сообщение
     if message.forward_from:
         new_admin_id = message.forward_from.id
-    # 2) текст
     elif message.text:
         txt = message.text.strip()
         if txt.startswith("@"):
@@ -451,13 +346,10 @@ async def on_admin_input(message: types.Message, state: FSMContext):
                 new_admin_id = int(txt)
             except Exception:
                 new_admin_id = None
-
     if not new_admin_id:
         await message.answer("Не удалось определить пользователя. Пришли @username, ID или перешли сообщение.")
         return
-
     async with AsyncSessionLocal() as session:
-        # проверяем владельца
         res = await session.execute(select(Channel).where(Channel.id == ch_id))
         ch = res.scalar_one_or_none()
         if not ch:
@@ -471,9 +363,7 @@ async def on_admin_input(message: types.Message, state: FSMContext):
         if new_admin_id == ch.owner_id:
             await message.answer("Владелец уже имеет полный доступ.")
             return
-        # создаём запись пользователя, если нужно
         await ensure_user(new_admin_id)
-        # проверяем, есть ли уже
         exists_res = await session.execute(
             select(ChannelAdmin).where(ChannelAdmin.channel_id == ch_id, ChannelAdmin.telegram_id == new_admin_id)
         )
@@ -483,14 +373,10 @@ async def on_admin_input(message: types.Message, state: FSMContext):
             session.add(ChannelAdmin(channel_id=ch_id, telegram_id=new_admin_id))
             await session.commit()
             await message.answer("Администратор добавлен.")
-
     await state.clear()
-    # Подскажем вернуться в меню админов
-    await message.answer("Администратор добавлен. Открой ‘Админы’ ещё раз из меню канала.")
 
-# Удаление администратора
 @dp.callback_query(lambda c: c.data and c.data.startswith("remove_admin:"))
-async def cb_remove_admin(cq: types.CallbackQuery):
+async def cb_remove_admin(cq: types.CallbackQuery, state: FSMContext):
     _, rest = cq.data.split(":", 1)
     ch_id_str, tg_id_str = rest.split(":", 1)
     ch_id = int(ch_id_str)
@@ -512,54 +398,52 @@ async def cb_remove_admin(cq: types.CallbackQuery):
         await session.delete(adm)
         await session.commit()
     await cq.answer("Удалён")
-    await cb_manage_admins(cq, FSMContext(storage=None, key=None))
+    cq.data = f"manage_admins:{ch_id}"
+    await cb_manage_admins(cq, state)
 
-@dp.message(StateFilter(None))
-async def catch_channel(message: types.Message, state: FSMContext):
-    # if forwarded from channel:
+# ---------- захват пересланного канала / @username вне FSM ----------
+
+async def _handle_channel_input(message: types.Message) -> bool:
     if message.forward_from_chat and message.forward_from_chat.type == "channel":
         ch = message.forward_from_chat
         async with AsyncSessionLocal() as session:
-            # find or create user
             await ensure_user(message.from_user.id, message.from_user.full_name)
-            res = await session.execute(select(Channel).where(Channel.chat_id==ch.id))
+            res = await session.execute(select(Channel).where(Channel.chat_id == ch.id))
             exists = res.scalar_one_or_none()
             if not exists:
                 new = Channel(chat_id=ch.id, username=ch.username, title=ch.title or ch.username, owner_id=message.from_user.id)
                 session.add(new)
                 await session.commit()
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Настроить цикл", callback_data=f"cycle_settings:{new.id}")]])
-                await message.reply(f"Канал {ch.title} добавлен и ты назначен владельцем.", reply_markup=kb)
+                await message.reply(f"Канал {ch.title} добавлен и ты назначен владельцем.", reply_markup=main_menu_kb())
             else:
                 await message.reply("Канал уже добавлен.")
-        return
-    # if text @username:
+        return True
     if message.text and message.text.startswith("@"):
         uname = message.text.strip()
         try:
             info = await bot.get_chat(uname)
             async with AsyncSessionLocal() as session:
                 await ensure_user(message.from_user.id, message.from_user.full_name)
-                res = await session.execute(select(Channel).where(Channel.chat_id==info.id))
+                res = await session.execute(select(Channel).where(Channel.chat_id == info.id))
                 exists = res.scalar_one_or_none()
                 if not exists:
                     new = Channel(chat_id=info.id, username=info.username, title=info.title or info.username, owner_id=message.from_user.id)
                     session.add(new)
                     await session.commit()
-                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Настроить цикл", callback_data=f"cycle_settings:{new.id}")]])
-                    await message.reply(f"Канал {info.title} добавлен.", reply_markup=kb)
+                    await message.reply(f"Канал {info.title} добавлен.", reply_markup=main_menu_kb())
                 else:
                     await message.reply("Канал уже добавлен.")
-        except Exception as e:
+        except Exception:
             await message.reply("Не удалось получить информацию о канале. Убедись, что бот добавлен и имеет доступ.")
-        return
-    # else ignore other messages (or handle FSM flows)
+        return True
+    return False
 
-# Старт создания поста
-@dp.callback_query(lambda c: c.data=="new_post")
+# ---------- создание поста: канал ----------
+
+@dp.callback_query(lambda c: c.data == "new_post")
 async def cb_new_post(cq: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     await ensure_user(cq.from_user.id, cq.from_user.full_name)
-    # показать выбор канала, где юзер владелец или админ
     async with AsyncSessionLocal() as session:
         owner_res = await session.execute(select(Channel).where(Channel.owner_id == cq.from_user.id))
         owner_channels = owner_res.scalars().all()
@@ -576,271 +460,42 @@ async def cb_new_post(cq: types.CallbackQuery, state: FSMContext):
     if not channels:
         await cq.answer("Нет доступных каналов", show_alert=True)
         return
-    rows = [[InlineKeyboardButton(text=channel_display_name(ch), callback_data=f"np_ch:{ch.id}")]
-            for ch in channels]
+    rows = [[InlineKeyboardButton(text=channel_display_name(ch), callback_data=f"np_ch:{ch.id}")] for ch in channels]
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_start")])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await state.set_state(NewPost.choose_channel)
-    await cq.message.edit_text("Выбери канал:", reply_markup=kb)
+    await safe_edit_message_text(cq.message, "1️⃣ Выбери канал:", InlineKeyboardMarkup(inline_keyboard=rows))
     await cq.answer()
+
+# ---------- создание поста: день недели ----------
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("np_ch:"), StateFilter(NewPost.choose_channel))
 async def np_choose_channel(cq: types.CallbackQuery, state: FSMContext):
-    ch_id = int(cq.data.split(":",1)[1])
+    ch_id = int(cq.data.split(":", 1)[1])
     await state.update_data(ch_id=ch_id)
-    # спросить неделю цикла
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-    weeks = ch.cycle_weeks or 1
-    rows = [[InlineKeyboardButton(text=f"Неделя {i+1}", callback_data=f"np_week:{i}")] for i in range(weeks)]
-    kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="↩️ Назад", callback_data="new_post")]])
-    await state.set_state(NewPost.choose_week)
-    await cq.message.edit_text("Выбери неделю в цикле:", reply_markup=kb)
+    await _show_weekday_menu(cq.message, state)
     await cq.answer()
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_week:"), StateFilter(NewPost.choose_week))
-async def np_choose_week(cq: types.CallbackQuery, state: FSMContext):
-    week = int(cq.data.split(":",1)[1])
-    await state.update_data(week=week)
-    # выбрать день недели с отметками существующих постов + счётчик
-    weekdays = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-    data = await state.get_data()
-    ch_id = data.get("ch_id")
-    # Считаем количество постов для каждого дня
-    posts_per_day = {}
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        from sqlalchemy import func
-        res = await session.execute(
-            select(Post.weekday, func.count(Post.id))
-            .where(Post.channel_id==ch_id, Post.week_in_cycle==week)
-            .group_by(Post.weekday)
-        )
-        for wd, cnt in res.all():
-            if wd is not None:
-                posts_per_day[int(wd)] = cnt
-    rows = []
-    for i in range(7):
-        cnt = posts_per_day.get(i, 0)
-        if cnt > 0:
-            label = f"{weekdays[i]} ({cnt})"
-        else:
-            label = weekdays[i]
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"np_wd:{i}")])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="⬅️ Недели", callback_data="new_post")]])
+async def _show_weekday_menu(message: types.Message, state: FSMContext):
+    rows = [[InlineKeyboardButton(text=WEEKDAYS_FULL[i], callback_data=f"np_wd:{i}")] for i in range(7)]
+    rows.append([InlineKeyboardButton(text="⬅️ Каналы", callback_data="new_post")])
     await state.set_state(NewPost.choose_weekday)
-    await cq.message.edit_text("Выбери день недели:", reply_markup=kb)
-    await cq.answer()
+    await safe_edit_message_text(message, "2️⃣ Выбери день недели:", InlineKeyboardMarkup(inline_keyboard=rows))
 
-# Назад к неделям из экрана дня
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_week:"), StateFilter(NewPost.choose_weekday))
-async def np_back_to_weeks(cq: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    ch_id = data.get("ch_id")
-    if not ch_id:
-        await cq.answer("Нет данных канала", show_alert=True)
-        return
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(Channel).where(Channel.id==ch_id))
-        ch = res.scalar_one_or_none()
-    weeks = (ch.cycle_weeks or 1) if ch else 1
-    rows = [[InlineKeyboardButton(text=f"Неделя {i+1}", callback_data=f"np_week:{i}")] for i in range(weeks)]
-    kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="⬅️ Каналы", callback_data="new_post")]])
-    await state.set_state(NewPost.choose_week)
-    await cq.message.edit_text("Выбери неделю в цикле:", reply_markup=kb)
-    await cq.answer()
+# ---------- создание поста: время ----------
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("np_wd:"), StateFilter(NewPost.choose_weekday))
 async def np_choose_weekday(cq: types.CallbackQuery, state: FSMContext):
-    wd = int(cq.data.split(":",1)[1])
+    wd = int(cq.data.split(":", 1)[1])
     await state.update_data(weekday=wd)
-    data = await state.get_data()
-    ch_id = data.get("ch_id")
-    week = data.get("week")
-    # получаем все посты для дня
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        res = await session.execute(
-            select(Post).where(Post.channel_id==ch_id, Post.week_in_cycle==week, Post.weekday==wd).order_by(Post.created_at.asc())
-        )
-        posts = res.scalars().all()
-    weekdays = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-    if posts:
-        await render_day_posts_menu(cq.message, ch_id, week, wd)
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_week:{week}")]])
-        await state.set_state(NewPost.choose_time)
-        await cq.message.edit_text("Введи время в формате HH:MM (МСК)", reply_markup=kb)
-    await cq.answer()
-
-# Назад из ввода времени: поддержим возврат к списку дней или недель
-@dp.callback_query(lambda c: c.data and (c.data.startswith("np_week:") or c.data.startswith("np_wd:")), StateFilter(NewPost.choose_time))
-async def np_back_from_time(cq: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    ch_id = data.get("ch_id")
-    week = data.get("week")
-    if cq.data.startswith("np_wd:"):
-        wd = int(cq.data.split(":",1)[1])
-        await state.set_state(NewPost.choose_weekday)
-        await state.update_data(weekday=wd)
-        await render_day_posts_menu(cq.message, ch_id, week, wd)
-    else:
-        # назад к неделям
-        async with AsyncSessionLocal() as session:
-            res = await session.execute(select(Channel).where(Channel.id==ch_id))
-            ch = res.scalar_one_or_none()
-        weeks = (ch.cycle_weeks or 1) if ch else 1
-        rows = [[InlineKeyboardButton(text=f"Неделя {i+1}", callback_data=f"np_week:{i}")] for i in range(weeks)]
-        kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(text="⬅️ Каналы", callback_data="new_post")]])
-        await state.set_state(NewPost.choose_week)
-        await cq.message.edit_text("Выбери неделю в цикле:", reply_markup=kb)
-    await cq.answer()
-
-# Кнопка: добавить новый пост в выбранный день
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_add:"), StateFilter(NewPost.choose_weekday))
-async def np_add_new_post(cq: types.CallbackQuery, state: FSMContext):
-    wd = int(cq.data.split(":",1)[1])
-    data = await state.get_data()
-    week = data.get("week")
-    await state.update_data(weekday=wd)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_wd:{wd}")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="np_back_to_wd")]])
     await state.set_state(NewPost.choose_time)
-    await cq.message.edit_text("Введи время в формате HH:MM (МСК)", reply_markup=kb)
+    await safe_edit_message_text(cq.message, f"3️⃣ {WEEKDAYS_FULL[wd]}\nВведи время в формате HH:MM (МСК):", kb)
     await cq.answer()
 
-# Просмотр конкретного поста
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_view:"), StateFilter(NewPost.choose_weekday))
-async def np_view_post(cq: types.CallbackQuery, state: FSMContext):
-    post_id = int(cq.data.split(":",1)[1])
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        res = await session.execute(select(Post).where(Post.id==post_id))
-        p = res.scalar_one_or_none()
-    if not p:
-        await cq.answer("Пост не найден", show_alert=True)
-        return
-    await state.update_data(weekday=p.weekday, week=p.week_in_cycle, ch_id=p.channel_id)
-    # Время (МСК)
-    try:
-        from zoneinfo import ZoneInfo
-        if p.next_run:
-            local_dt = (p.next_run if p.next_run.tzinfo else p.next_run.replace(tzinfo=ZoneInfo("UTC"))).astimezone(ZoneInfo("Europe/Moscow"))
-            when_str = local_dt.strftime("%d.%m.%Y %H:%M (МСК)")
-        else:
-            when_str = "не запланирован"
-    except Exception:
-        when_str = "не запланирован"
-
-    kb_manage = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"np_start_edit:{p.id}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"np_del_confirm:{p.id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_wd:{p.weekday}")],
-    ])
-    # подготавливаем entities для форматирования
-    entities = None
-    if p.text_entities:
-        try:
-            from aiogram.types import MessageEntity
-            entities = [MessageEntity(**e) for e in p.text_entities]
-        except Exception:
-            entities = None
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
-    if p.media_group:
-        # отправим альбом, потом отдельным сообщением текст с форматированием и клавиатурой управления
-        from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
-        media = []
-        for it in p.media_group:
-            t = it.get("type")
-            fid = it.get("file_id")
-            if t == "photo":
-                media.append(InputMediaPhoto(media=fid))
-            elif t == "video":
-                media.append(InputMediaVideo(media=fid))
-            elif t == "document":
-                media.append(InputMediaDocument(media=fid))
-        if media:
-            await bot.send_media_group(chat_id=cq.message.chat.id, media=media)
-        text_preview = p.text or "Предпросмотр медиагруппы"
-        await bot.send_message(chat_id=cq.message.chat.id, text=text_preview, entities=entities, reply_markup=kb_manage)
-    elif p.media_type == "photo":
-        await bot.send_photo(chat_id=cq.message.chat.id, photo=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
-    elif p.media_type == "video":
-        await bot.send_video(chat_id=cq.message.chat.id, video=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
-    elif p.media_type == "document":
-        await bot.send_document(chat_id=cq.message.chat.id, document=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
-    elif p.media_type == "voice":
-        await bot.send_voice(chat_id=cq.message.chat.id, voice=p.media_file_id, caption=p.text, caption_entities=entities, reply_markup=kb_manage)
-    elif p.media_type == "video_note":
-        await bot.send_video_note(chat_id=cq.message.chat.id, video_note=p.media_file_id)
-        await bot.send_message(chat_id=cq.message.chat.id, text=(p.text or "Кружок."), entities=entities, reply_markup=kb_manage)
-    else:
-        await bot.send_message(chat_id=cq.message.chat.id, text=(p.text or "Пост без текста"), entities=entities, reply_markup=kb_manage)
+@dp.callback_query(lambda c: c.data == "np_back_to_wd", StateFilter(NewPost.choose_time, NewPost.input_content, NewPost.ask_button, NewPost.input_button, NewPost.preview))
+async def np_back_to_wd(cq: types.CallbackQuery, state: FSMContext):
+    await _show_weekday_menu(cq.message, state)
     await cq.answer()
-
-# Подтверждение удаления поста
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_del_confirm:"), StateFilter(NewPost.choose_weekday))
-async def np_del_confirm(cq: types.CallbackQuery, state: FSMContext):
-    post_id = int(cq.data.split(":",1)[1])
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        res = await session.execute(select(Post).where(Post.id==post_id))
-        p = res.scalar_one_or_none()
-    if not p:
-        await cq.answer("Пост не найден", show_alert=True)
-        return
-    rows = [
-        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"np_del:{post_id}")],
-        [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"np_view:{post_id}")],
-    ]
-    await safe_edit_message_text(cq.message, "Удалить этот пост?", InlineKeyboardMarkup(inline_keyboard=rows))
-    await cq.answer()
-
-# Начать редактирование поста (работает из любого состояния)
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_start_edit:"))
-async def np_start_edit(cq: types.CallbackQuery, state: FSMContext):
-    post_id = int(cq.data.split(":",1)[1])
-    await state.update_data(editing_post_id=post_id)
-    # загрузим пост, чтобы показать текущее время и кнопку назад
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        res = await session.execute(select(Post).where(Post.id==post_id))
-        p = res.scalar_one_or_none()
-    if not p:
-        await cq.answer("Пост не найден", show_alert=True)
-        return
-    cur_time = p.time_text or "HH:MM"
-    await state.set_state(NewPost.choose_time)
-    await safe_edit_message_text(
-        cq.message,
-        f"Введи время (МСК), текущее {cur_time}:",
-        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_wd:{p.weekday}")]])
-    )
-    await cq.answer()
-
-# Удаление поста
-@dp.callback_query(lambda c: c.data and c.data.startswith("np_del:"), StateFilter(NewPost.choose_weekday))
-async def np_delete_post(cq: types.CallbackQuery, state: FSMContext):
-    post_id = int(cq.data.split(":",1)[1])
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        res = await session.execute(select(Post).where(Post.id==post_id))
-        p = res.scalar_one_or_none()
-        if not p:
-            await cq.answer("Пост не найден", show_alert=True)
-            return
-        week, wd = p.week_in_cycle, p.weekday
-        await session.delete(p)
-        await session.commit()
-    await cq.answer("Удалено")
-    # вернуться к списку постов дня
-    data = await state.get_data()
-    ch_id = data.get("ch_id")
-    week = data.get("week")
-    await render_day_posts_menu(cq.message, ch_id, week, wd)
 
 @dp.message(StateFilter(NewPost.choose_time))
 async def np_input_time(message: types.Message, state: FSMContext):
@@ -852,130 +507,125 @@ async def np_input_time(message: types.Message, state: FSMContext):
         await message.answer("Неверный формат. Введи HH:MM")
         return
     await state.update_data(time_text=f"{hh:02d}:{mm:02d}")
-    await state.set_state(NewPost.input_text)
-    await message.answer("Пришли текст поста (или отправь ‘-’ чтобы пропустить)")
+    await state.set_state(NewPost.input_content)
+    await message.answer(
+        "4️⃣ Пришли пост одним сообщением: текст и/или фото/видео/документ.\n"
+        "Поддерживаются альбомы и premium-эмодзи (всё форматирование сохранится).",
+    )
 
-@dp.message(StateFilter(NewPost.input_text))
-async def np_input_text(message: types.Message, state: FSMContext):
-    # В режиме редактирования '-' оставит текст/entities без изменений
-    data = await state.get_data()
-    is_edit = bool(data.get("editing_post_id"))
-    if message.text == "-" and is_edit:
-        text_value = None
-        entities_value = None
-    else:
-        text_value = message.text
-        # Сохраняем entities от пользователя (Telegram парсит Markdown/HTML автоматически)
-        entities_value = [e.model_dump(mode="json") for e in (message.entities or [])] if hasattr(message, "entities") else None
-    await state.update_data(text=text_value, text_entities=entities_value)
-    await state.set_state(NewPost.input_media)
-    await message.answer("Пришли медиа (фото/видео/документ) или ‘-’ чтобы пропустить")
+# ---------- создание поста: контент (одно сообщение или альбом) ----------
 
-@dp.message(StateFilter(NewPost.input_media))
-async def np_input_media(message: types.Message, state: FSMContext):
-    media_type, media_id = None, None
-    media_group = None
-    # 1) Медиагруппа – приоритетно
-    if getattr(message, "media_group_id", None):
-        item = None
-        if message.photo:
-            item = {"type": "photo", "file_id": message.photo[-1].file_id}
-        elif message.video:
-            item = {"type": "video", "file_id": message.video.file_id}
-        elif message.document:
-            item = {"type": "document", "file_id": message.document.file_id}
-        if item:
-            cur = (await state.get_data()).get("media_group") or []
-            cur.append(item)
-            await state.update_data(media_group=cur)
-            await message.answer("Медиагруппа: элемент добавлен. Отправь ещё элементы альбома или '-' для завершения.")
-            return
-    # 2) Завершение ввода медиа
-    if message.text and message.text.strip() == "-":
-        # в режиме редактирования '-' оставит медиа без изменений
-        pass
-    # 3) Одиночные медиа
-    elif message.photo:
-        media_type = "photo"
-        media_id = message.photo[-1].file_id
-    elif message.video:
-        media_type = "video"
-        media_id = message.video.file_id
-    elif message.document:
-        media_type = "document"
-        media_id = message.document.file_id
-    elif message.animation:
-        media_type = "document"
-        media_id = message.animation.file_id
-    elif message.video_note:
-        # кружок — отдельный тип, у него нет caption и кнопок
-        media_type = "video_note"
-        media_id = message.video_note.file_id
-        await message.answer("Добавлен кружок. Учти: к кружкам нельзя добавлять подпись и кнопки.")
-    elif message.voice:
-        media_type = "voice"
-        media_id = message.voice.file_id
-    elif message.media_group_id:
-        # медиагруппа: соберём файлы из альбома
-        # в aiogram 3 альбом приходит серией сообщений; здесь мы фиксируем один элемент
-        item = None
-        if message.photo:
-            item = {"type": "photo", "file_id": message.photo[-1].file_id}
-        elif message.video:
-            item = {"type": "video", "file_id": message.video.file_id}
-        elif message.document:
-            item = {"type": "document", "file_id": message.document.file_id}
-        if item:
-            cur = (await state.get_data()).get("media_group") or []
-            cur.append(item)
-            await state.update_data(media_group=cur)
-            await message.answer("Медиагруппа: элемент добавлен. Отправь ещё элементы альбома или '-' для завершения.")
-            return
-    await state.update_data(media_type=media_type, media_file_id=media_id)
+# Буфер для сборки альбомов: media_group_id -> {"chat_id":int, "ids":[message_id], "user_id":int, "task":Task}
+_album_buffer: dict[str, dict] = {}
+_album_lock = asyncio.Lock()
+
+@dp.message(StateFilter(NewPost.input_content))
+async def np_input_content(message: types.Message, state: FSMContext):
+    # Альбом — собираем все message_id с одинаковым media_group_id
+    if message.media_group_id:
+        mgid = message.media_group_id
+        async with _album_lock:
+            entry = _album_buffer.get(mgid)
+            if not entry:
+                entry = {
+                    "chat_id": message.chat.id,
+                    "ids": [],
+                    "user_id": message.from_user.id,
+                    "state": state,
+                    "task": None,
+                }
+                _album_buffer[mgid] = entry
+            entry["ids"].append(message.message_id)
+            # перезапускаем таймер ожидания (1.5с после последнего сообщения)
+            if entry["task"]:
+                entry["task"].cancel()
+            entry["task"] = asyncio.create_task(_finalize_album(mgid))
+        return
+
+    # Одиночное сообщение: текст или медиа+caption
+    src_chat_id = message.chat.id
+    src_message_id = message.message_id
+    text = message.caption if message.caption is not None else message.text
+    await state.update_data(
+        src_chat_id=src_chat_id,
+        src_message_id=src_message_id,
+        src_message_ids=None,
+        text=text,
+        text_entities=None,
+        media_type=None,
+        media_file_id=None,
+        media_group=None,
+    )
+    await _show_buttons_menu(message, state)
+
+async def _finalize_album(mgid: str):
+    try:
+        await asyncio.sleep(1.5)
+    except asyncio.CancelledError:
+        return
+    async with _album_lock:
+        entry = _album_buffer.pop(mgid, None)
+    if not entry:
+        return
+    state: FSMContext = entry["state"]
+    ids = sorted(entry["ids"])
+    await state.update_data(
+        src_chat_id=entry["chat_id"],
+        src_message_id=None,
+        src_message_ids=ids,
+        text=None,
+        text_entities=None,
+        media_type=None,
+        media_file_id=None,
+        media_group=None,
+    )
+    fake = await bot.send_message(chat_id=entry["chat_id"], text=f"📸 Альбом из {len(ids)} элемент(ов) принят.")
+    await _show_buttons_menu(fake, state)
+
+# ---------- создание поста: кнопки ----------
+
+async def _show_buttons_menu(message: types.Message, state: FSMContext):
     await state.set_state(NewPost.ask_button)
-    buttons = (await state.get_data()).get("buttons") or []
-    rows = [
-        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")],
-    ]
-    if buttons:
-        rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="np_btn_done")])
-        rows.append([InlineKeyboardButton(text="🗑 Очистить", callback_data="np_btn_clear")])
-    else:
-        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")])
-    await message.answer("Кнопки поста:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-@dp.callback_query(lambda c: c.data in ("np_btn_add","np_btn_done","np_btn_clear"), StateFilter(NewPost.ask_button))
-async def np_buttons_menu(cq: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    buttons = data.get("buttons") or []
-    if cq.data == "np_btn_add":
-        await state.set_state(NewPost.input_button)
-        await cq.message.edit_text("Пришли текст кнопки и ссылку через перенос строки:\nТекст\nhttps://example.com")
-        await cq.answer()
-    elif cq.data == "np_btn_clear":
-        await state.update_data(buttons=[])
-        await cq.message.edit_text("Кнопки очищены. Можно добавить новые или продолжить.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")],[InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")]]))
-        await cq.answer()
-    else:
-        # Готово — показываем предпросмотр перед сохранением
-        await cq.answer()
-        await state.set_state(NewPost.preview)
-        await send_post_preview(cq.message, state)
-
-# Если в состоянии выбора кнопок пользователь прислал текст, а не нажал inline — повторно показываем меню
-@dp.message(StateFilter(NewPost.ask_button))
-async def np_buttons_menu_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     buttons = data.get("buttons") or []
     rows = [[InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")]]
     if buttons:
+        for i, b in enumerate(buttons):
+            rows.append([InlineKeyboardButton(text=f"❌ {b.get('text','')[:30]}", callback_data=f"np_btn_del:{i}")])
         rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="np_btn_done")])
-        rows.append([InlineKeyboardButton(text="🗑 Очистить", callback_data="np_btn_clear")])
     else:
         rows.append([InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")])
-    await message.answer("Пожалуйста, воспользуйся кнопками ниже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="np_back_to_wd")])
+    text = "5️⃣ Кнопки поста:\n" + ("\n".join([f"• {b.get('text','')} → {b.get('url','')}" for b in buttons]) if buttons else "пока нет")
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
-# Ввод одной кнопки: две строки (текст и ссылка). После добавления возвращаемся в меню кнопок
+@dp.callback_query(lambda c: c.data == "np_btn_add", StateFilter(NewPost.ask_button))
+async def np_btn_add(cq: types.CallbackQuery, state: FSMContext):
+    await state.set_state(NewPost.input_button)
+    await safe_edit_message_text(cq.message, "Пришли текст кнопки и ссылку через перенос строки:\nТекст\nhttps://example.com")
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("np_btn_del:"), StateFilter(NewPost.ask_button))
+async def np_btn_del(cq: types.CallbackQuery, state: FSMContext):
+    idx = int(cq.data.split(":", 1)[1])
+    data = await state.get_data()
+    buttons = data.get("buttons") or []
+    if 0 <= idx < len(buttons):
+        buttons.pop(idx)
+        await state.update_data(buttons=buttons)
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await _show_buttons_menu(cq.message, state)
+    await cq.answer("Кнопка удалена")
+
+@dp.callback_query(lambda c: c.data == "np_btn_done", StateFilter(NewPost.ask_button))
+async def np_btn_done(cq: types.CallbackQuery, state: FSMContext):
+    await cq.answer()
+    await state.set_state(NewPost.preview)
+    await send_post_preview(cq.message, state)
+
 @dp.message(StateFilter(NewPost.input_button))
 async def np_input_button(message: types.Message, state: FSMContext):
     lines = (message.text or "").splitlines()
@@ -988,123 +638,13 @@ async def np_input_button(message: types.Message, state: FSMContext):
     buttons = data.get("buttons") or []
     buttons.append({"text": text, "url": url})
     await state.update_data(buttons=buttons)
-    await state.set_state(NewPost.ask_button)
-    rows = [
-        [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")],
-        [InlineKeyboardButton(text="✅ Готово", callback_data="np_btn_done")],
-        [InlineKeyboardButton(text="🗑 Очистить", callback_data="np_btn_clear")],
-    ]
-    await message.answer("Кнопка добавлена. Добавить ещё?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _show_buttons_menu(message, state)
 
-async def finalize_post(message_or_message, state: FSMContext):
-    data = await state.get_data()
-    ch_id = data["ch_id"]
-    week = data["week"]
-    weekday = data["weekday"]
-    time_text = data["time_text"]
-    text = data.get("text")
-    media_type = data.get("media_type")
-    media_file_id = data.get("media_file_id")
-    button_text = data.get("button_text")
-    button_url = data.get("button_url")
-    text_entities = data.get("text_entities")
-    buttons = data.get("buttons") or None
-    media_group = data.get("media_group") or None
+# ---------- предпросмотр и сохранение ----------
 
-    async with AsyncSessionLocal() as session:
-        # вычисляем next_run
-        from datetime import datetime, time as dtime
-        from .models import Channel, Post
-        from .utils import compute_next_run_cycle_tz
-        res = await session.execute(select(Channel).where(Channel.id == ch_id))
-        ch = res.scalar_one_or_none()
-        if not ch:
-            await state.clear()
-            await message_or_message.answer("Канал не найден")
-            return
-        # если редактирование — загрузим текущий пост
-        editing_post_id = data.get("editing_post_id")
-        existing = None
-        if editing_post_id:
-            eres = await session.execute(select(Post).where(Post.id==editing_post_id))
-            existing = eres.scalar_one_or_none()
-        hh, mm = map(int, time_text.split(":"))
-        # рассчитываем по МСК, в БД сохраняем UTC
-        now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
-        next_run = compute_next_run_cycle_tz(
-            now_utc=now_utc,
-            cycle_weeks=ch.cycle_weeks or 1,
-            cycle_start_utc=ch.cycle_start if ch.cycle_start.tzinfo else ch.cycle_start.replace(tzinfo=ZoneInfo("UTC")),
-            week_in_cycle=week,
-            weekday=weekday,
-            t_local=dtime(hh, mm),
-            tz_name="Europe/Moscow",
-        )
-        # Если пользователь выбрал уже прошедшее время сегодня (МСК) с небольшим опозданием, пошлём ближайшим временем
-        try:
-            now_local = now_utc.astimezone(ZoneInfo("Europe/Moscow"))
-            candidate_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if now_local.weekday() == weekday and now_local >= candidate_local and (now_local - candidate_local) <= timedelta(minutes=15):
-                next_run = now_utc + timedelta(seconds=30)
-        except Exception:
-            pass
-        if existing:
-            # слияние значений: None означает оставить как было
-            existing.text = existing.text if text is None else text
-            if text_entities is not None:
-                existing.text_entities = text_entities
-            if media_type is not None:
-                existing.media_type = media_type
-                existing.media_file_id = media_file_id
-            if media_group is not None:
-                existing.media_group = media_group
-            # кнопка: если не пришла — оставляем как было
-            if button_text is not None and button_url is not None:
-                existing.button_text = button_text
-                existing.button_url = button_url
-            if buttons is not None:
-                existing.buttons = buttons
-            existing.time_text = time_text
-            existing.next_run = next_run
-            existing.week_in_cycle = week
-            existing.weekday = weekday
-        else:
-            post = Post(
-                channel_id=ch_id,
-                text=text,
-                text_entities=text_entities,
-                media_type=media_type,
-                media_file_id=media_file_id,
-                media_group=media_group,
-                button_text=button_text,
-                button_url=button_url,
-                buttons=buttons,
-                next_run=next_run,
-                week_in_cycle=week,
-                weekday=weekday,
-                time_text=time_text,
-                created_by=message_or_message.from_user.id,
-            )
-            session.add(post)
-        await session.commit()
-    await state.clear()
-    end_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Новый пост", callback_data="new_post")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_start")],
-    ])
-    await message_or_message.answer("Слот сохранён.", reply_markup=end_kb)
-
-# Предпросмотр слота перед сохранением
 async def send_post_preview(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    text = data.get("text")
-    text_entities = data.get("text_entities")
-    media_type = data.get("media_type")
-    media_file_id = data.get("media_file_id")
-    media_group = data.get("media_group")
     buttons = data.get("buttons") or []
-
-    # Собираем клавиатуру поста (внешние кнопки)
     rows = []
     for b in buttons:
         t = (b.get("text") or "").strip()
@@ -1113,189 +653,120 @@ async def send_post_preview(message: types.Message, state: FSMContext):
             rows.append([InlineKeyboardButton(text=t, url=u)])
     post_kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
-    # Entities
-    entities = None
-    if text_entities:
-        try:
-            from aiogram.types import MessageEntity
-            entities = [MessageEntity(**e) for e in text_entities]
-        except Exception:
-            entities = None
+    src_chat_id = data.get("src_chat_id")
+    src_message_id = data.get("src_message_id")
+    src_message_ids = data.get("src_message_ids")
+    text = data.get("text")
 
-    # Предупреждения по ограничениям
-    warn_lines = []
-    if media_type == "video_note" and (text or buttons):
-        warn_lines.append("Внимание: к кружкам нельзя добавлять подпись и кнопки. Текст/кнопки будут отправлены отдельно.")
-    if media_group and buttons:
-        warn_lines.append("Внимание: у медиагруппы нет кнопок — они будут отправлены отдельным сообщением.")
-
-    # Отрисовка предпросмотра
-    if media_group:
-        from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
-        media = []
-        
-        # Если НЕТ кнопок, добавляем текст как caption к первому элементу при создании
-        add_caption_to_first = not post_kb and (text or entities)
-        
-        for idx, it in enumerate(media_group):
-            t = it.get("type")
-            fid = it.get("file_id")
-            
-            # Для первого элемента добавляем caption, если нужно
-            if idx == 0 and add_caption_to_first:
-                if t == "photo":
-                    media.append(InputMediaPhoto(media=fid, caption=text, caption_entities=entities))
-                elif t == "video":
-                    media.append(InputMediaVideo(media=fid, caption=text, caption_entities=entities))
-                elif t == "document":
-                    media.append(InputMediaDocument(media=fid, caption=text, caption_entities=entities))
-            else:
-                if t == "photo":
-                    media.append(InputMediaPhoto(media=fid))
-                elif t == "video":
-                    media.append(InputMediaVideo(media=fid))
-                elif t == "document":
-                    media.append(InputMediaDocument(media=fid))
-        
-        if media:
-            await bot.send_media_group(chat_id=message.chat.id, media=media)
-            # Если ЕСТЬ кнопки или предупреждения, отправляем текст отдельным сообщением
-            if post_kb or warn_lines:
-                extra_text = None
-                if post_kb and text:
-                    extra_text = text
-                elif warn_lines:
-                    extra_text = "\n".join(warn_lines)
-                if extra_text:
-                    # Сохраняем entities, если есть
-                    await bot.send_message(chat_id=message.chat.id, text=extra_text, entities=entities if post_kb else None, reply_markup=post_kb)
-    elif media_type == "photo":
-        await bot.send_photo(chat_id=message.chat.id, photo=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
-    elif media_type == "video":
-        await bot.send_video(chat_id=message.chat.id, video=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
-    elif media_type == "document":
-        await bot.send_document(chat_id=message.chat.id, document=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
-    elif media_type == "voice":
-        await bot.send_voice(chat_id=message.chat.id, voice=media_file_id, caption=text, caption_entities=entities, reply_markup=post_kb)
-    elif media_type == "video_note":
-        await bot.send_video_note(chat_id=message.chat.id, video_note=media_file_id)
-        if text or buttons or warn_lines:
-            extra = ("\n"+"\n".join(warn_lines)) if warn_lines else ""
-            await bot.send_message(chat_id=message.chat.id, text=(text or "Кружок")+extra, entities=entities)
+    # Превью через copy_message — это сохранит premium-эмодзи и форматирование 1:1
+    if src_chat_id and src_message_ids:
+        await bot.copy_messages(chat_id=message.chat.id, from_chat_id=src_chat_id, message_ids=src_message_ids)
+        if post_kb:
+            await bot.send_message(chat_id=message.chat.id, text=(text or "⬇️"), reply_markup=post_kb)
+            await bot.send_message(chat_id=message.chat.id, text="ℹ️ У альбома кнопки прикрепляются отдельным сообщением.")
+    elif src_chat_id and src_message_id:
+        await bot.copy_message(chat_id=message.chat.id, from_chat_id=src_chat_id, message_id=src_message_id, reply_markup=post_kb)
     else:
-        await bot.send_message(chat_id=message.chat.id, text=(text or "Пост без текста"), entities=entities, reply_markup=post_kb)
+        await bot.send_message(chat_id=message.chat.id, text=(text or "Пост без содержимого"), reply_markup=post_kb)
 
-    # Кнопки подтверждения предпросмотра
+    # сводка времени
+    weekday = data.get("weekday")
+    time_text = data.get("time_text")
+    summary = f"📅 {WEEKDAYS_FULL[weekday]} в {time_text} (МСК)"
     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Сохранить", callback_data="np_preview_save")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="np_preview_back")],
     ])
-    await bot.send_message(chat_id=message.chat.id, text="Сохранить этот слот?", reply_markup=confirm_kb)
+    await bot.send_message(chat_id=message.chat.id, text=f"6️⃣ Предпросмотр\n{summary}\n\nСохранить пост?", reply_markup=confirm_kb)
 
-@dp.callback_query(lambda c: c.data=="np_preview_save", StateFilter(NewPost.preview))
+@dp.callback_query(lambda c: c.data == "np_preview_save", StateFilter(NewPost.preview))
 async def np_preview_save(cq: types.CallbackQuery, state: FSMContext):
     await finalize_post(cq.message, state)
     await cq.answer()
 
-@dp.callback_query(lambda c: c.data=="np_preview_back", StateFilter(NewPost.preview))
+@dp.callback_query(lambda c: c.data == "np_preview_back", StateFilter(NewPost.preview))
 async def np_preview_back(cq: types.CallbackQuery, state: FSMContext):
-    # вернёмся в меню кнопок
-    await state.set_state(NewPost.ask_button)
-    data = await state.get_data()
-    buttons = data.get("buttons") or []
-    rows = [[InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="np_btn_add")]]
-    if buttons:
-        rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="np_btn_done")])
-        rows.append([InlineKeyboardButton(text="🗑 Очистить", callback_data="np_btn_clear")])
-    else:
-        rows.append([InlineKeyboardButton(text="Пропустить", callback_data="np_btn_done")])
-    await cq.message.edit_text("Кнопки поста:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _show_buttons_menu(cq.message, state)
     await cq.answer()
 
-async def render_day_posts_menu(message: types.Message, ch_id: int, week: int, wd: int):
-    async def safe_edit_message_text(msg: types.Message, text: str, kb: InlineKeyboardMarkup | None = None):
-        try:
-            await msg.edit_text(text, reply_markup=kb)
-        except TelegramBadRequest:
-            # Текущее сообщение может быть медиа с подписью — отправим новое и попробуем удалить старое
-            sent = await bot.send_message(chat_id=msg.chat.id, text=text, reply_markup=kb)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-    async with AsyncSessionLocal() as session:
-        from .models import Post
-        res = await session.execute(
-            select(Post)
-            .where(Post.channel_id == ch_id, Post.week_in_cycle == week, Post.weekday == wd)
-            .order_by(Post.created_at.asc())
-        )
-        posts = res.scalars().all()
+async def finalize_post(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ch_id = data["ch_id"]
+    weekday = data["weekday"]
+    time_text = data["time_text"]
+    text = data.get("text")
+    src_chat_id = data.get("src_chat_id")
+    src_message_id = data.get("src_message_id")
+    src_message_ids = data.get("src_message_ids")
+    buttons = data.get("buttons") or None
 
-    weekdays = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
-    if posts:
-        rows = []
-        for idx, p in enumerate(posts, start=1):
-            # Формируем превью: время + первые слова текста
-            preview_parts = []
-            if p.time_text:
-                preview_parts.append(p.time_text)
-            if p.text:
-                # Берём первые 20 символов текста
-                text_preview = p.text[:20].replace("\n", " ")
-                if len(p.text) > 20:
-                    text_preview += "..."
-                preview_parts.append(text_preview)
-            elif p.media_type:
-                # Если текста нет, покажем тип медиа
-                media_labels = {
-                    "photo": "📷",
-                    "video": "🎬",
-                    "document": "📄",
-                    "voice": "🎤",
-                    "video_note": "⭕️"
-                }
-                if p.media_group:
-                    preview_parts.append("🖼 Альбом")
-                else:
-                    preview_parts.append(media_labels.get(p.media_type, "📎"))
-            
-            preview = " - ".join(preview_parts) if preview_parts else ""
-            button_text = f"Пост {idx} - {preview}" if preview else f"Пост {idx}"
-            rows.append([InlineKeyboardButton(text=button_text, callback_data=f"np_view:{p.id}")])
-        rows.append([InlineKeyboardButton(text="➕ Добавить пост", callback_data=f"np_add:{wd}")])
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_week:{week}")])
-        await safe_edit_message_text(message, f"{weekdays[wd]}: выбери пост или добавь новый", InlineKeyboardMarkup(inline_keyboard=rows))
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"np_week:{week}")]])
-        await safe_edit_message_text(message, "В этом дне ещё нет постов. Нажми ‘➕ Добавить пост’ ниже или вернись назад.", kb)
-
-# Специальный хэндлер: пересланное сообщение из канала — добавление канала
-@dp.message()
-async def add_channel_from_forward(message: types.Message, state: FSMContext):
-    # обрабатываем только пересланные из каналов
-    if not (message.forward_from_chat and getattr(message.forward_from_chat, "type", None) == "channel"):
-        return
-    # если сейчас вводим админа — не перехватываем
-    cur = await state.get_state()
-    if cur == ManageAdmins.wait_input:
-        return
-    ch = message.forward_from_chat
     async with AsyncSessionLocal() as session:
-        await ensure_user(message.from_user.id, message.from_user.full_name)
-        res = await session.execute(select(Channel).where(Channel.chat_id==ch.id))
-        exists = res.scalar_one_or_none()
-        if not exists:
-            new = Channel(chat_id=ch.id, username=ch.username, title=ch.title or ch.username, owner_id=message.from_user.id)
-            session.add(new)
-            await session.commit()
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ Настроить цикл", callback_data=f"cycle_settings:{new.id}")]])
-            await message.reply(f"Канал {ch.title} добавлен и ты назначен владельцем.", reply_markup=kb)
+        res = await session.execute(select(Channel).where(Channel.id == ch_id))
+        ch = res.scalar_one_or_none()
+        if not ch:
+            await state.clear()
+            await message.answer("Канал не найден")
+            return
+        hh, mm = map(int, time_text.split(":"))
+        now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+        next_run = compute_next_weekday_time_tz(now_utc, weekday, dtime(hh, mm), "Europe/Moscow")
+
+        editing_post_id = data.get("editing_post_id")
+        if editing_post_id:
+            eres = await session.execute(select(Post).where(Post.id == editing_post_id))
+            existing = eres.scalar_one_or_none()
         else:
-            await message.reply("Канал уже добавлен.")
-    return
+            existing = None
 
-        
+        if existing:
+            existing.text = text
+            existing.src_chat_id = src_chat_id
+            existing.src_message_id = src_message_id
+            existing.src_message_ids = src_message_ids
+            existing.buttons = buttons
+            existing.time_text = time_text
+            existing.weekday = weekday
+            existing.week_in_cycle = None
+            existing.next_run = next_run
+            # сбрасываем legacy-поля
+            existing.media_type = None
+            existing.media_file_id = None
+            existing.media_group = None
+            existing.text_entities = None
+        else:
+            post = Post(
+                channel_id=ch_id,
+                text=text,
+                src_chat_id=src_chat_id,
+                src_message_id=src_message_id,
+                src_message_ids=src_message_ids,
+                buttons=buttons,
+                next_run=next_run,
+                weekday=weekday,
+                time_text=time_text,
+                created_by=message.from_user.id,
+            )
+            session.add(post)
+        await session.commit()
+    await state.clear()
+    end_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Новый пост", callback_data="new_post")],
+        [InlineKeyboardButton(text="📚 Мои каналы", callback_data="my_channels")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_start")],
+    ])
+    await message.answer(f"✅ Пост сохранён.\n📅 {WEEKDAYS_FULL[weekday]} в {time_text} (МСК)", reply_markup=end_kb)
+
+# ---------- ловушка вне FSM: пересланный канал / @username ----------
+
+@dp.message(StateFilter(None))
+async def catch_outside_fsm(message: types.Message, state: FSMContext):
+    handled = await _handle_channel_input(message)
+    if not handled:
+        # игнорируем
+        pass
+
+# ---------- entry point ----------
+
 async def main():
     print("Starting bot...")
     await init_db()
