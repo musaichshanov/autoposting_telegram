@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from app.db import AsyncSessionLocal, init_db
 from app.models import User, Channel, ChannelAdmin, Post
 from sqlalchemy.future import select
+from sqlalchemy import or_
 from datetime import datetime, time as dtime, timedelta
 from app.utils import compute_next_weekday_time_tz
 from zoneinfo import ZoneInfo
@@ -143,8 +144,12 @@ async def cb_open_channel(cq: types.CallbackQuery):
 async def cb_posts_list(cq: types.CallbackQuery):
     ch_id = int(cq.data.split(":", 1)[1])
     async with AsyncSessionLocal() as session:
+        # показываем pending (next_run != None) и неотправленные (последний статус — ошибка)
         res = await session.execute(
-            select(Post).where(Post.channel_id == ch_id, Post.next_run != None).order_by(Post.next_run.asc())
+            select(Post)
+            .where(Post.channel_id == ch_id)
+            .where(or_(Post.next_run != None, Post.last_status.like("error%")))
+            .order_by(Post.next_run.asc().nulls_last(), Post.id.asc())
         )
         posts = res.scalars().all()
     if not posts:
@@ -157,7 +162,8 @@ async def cb_posts_list(cq: types.CallbackQuery):
         wd = WEEKDAYS[p.weekday] if p.weekday is not None else "?"
         t = p.time_text or "?"
         prev = (p.text or "").replace("\n", " ")[:25]
-        label = f"{wd} {t}" + (f" — {prev}" if prev else "")
+        prefix = "⚠️ " if (p.last_status or "").startswith("error") else ""
+        label = f"{prefix}{wd} {t}" + (f" — {prev}" if prev else "")
         rows.append([InlineKeyboardButton(text=label, callback_data=f"post_view:{p.id}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"open_channel:{ch_id}")])
     await safe_edit_message_text(cq.message, "Запланированные посты:", InlineKeyboardMarkup(inline_keyboard=rows))
@@ -236,7 +242,13 @@ async def cb_post_view(cq: types.CallbackQuery):
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"post_del:{p.id}")],
         [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"posts_list:{p.channel_id}")],
     ])
-    await bot.send_message(chat_id=chat_id, text=f"📅 {wd} в {p.time_text}\n⏰ Ближайшая отправка: {when}", reply_markup=manage)
+    info = f"📅 {wd} в {p.time_text}\n⏰ Ближайшая отправка: {when}"
+    if (p.last_status or "").startswith("error"):
+        err = p.last_status[len("error:"):] if p.last_status.startswith("error:") else p.last_status
+        if "not a member of the channel" in err.lower() or "forbidden" in err.lower():
+            err = "Бот не добавлен в канал как админ"
+        info += f"\n⚠️ Ошибка отправки: {err[:200]}"
+    await bot.send_message(chat_id=chat_id, text=info, reply_markup=manage)
     await cq.answer()
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("post_del:"))

@@ -170,8 +170,9 @@ async def _send_post_async(post_id: int):
             logger.info(f"send_post: sent post {p.id} to chat {ch.chat_id} (one-shot)")
             return {"ok": True, "post_id": p.id}
         except Exception as e:
+            # next_run обнуляем, чтобы не ретраить бесконечно (пост одноразовый)
             await session.execute(
-                update(Post).where(Post.id == p.id).values(last_status=f"error:{str(e)}")
+                update(Post).where(Post.id == p.id).values(last_status=f"error:{str(e)}", next_run=None)
             )
             await session.commit()
             logger.exception(f"send_post: error sending post {p.id}: {e}")
