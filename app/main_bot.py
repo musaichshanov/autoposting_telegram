@@ -542,29 +542,34 @@ async def np_input_content(message: types.Message, state: FSMContext):
                 entry = {
                     "chat_id": message.chat.id,
                     "ids": [],
+                    "caption": None,
                     "user_id": message.from_user.id,
                     "state": state,
                     "task": None,
                 }
                 _album_buffer[mgid] = entry
             entry["ids"].append(message.message_id)
+            # caption у альбома обычно на первом сообщении — берём первый непустой
+            if not entry["caption"] and message.caption:
+                entry["caption"] = message.caption
             # перезапускаем таймер ожидания (1.5с после последнего сообщения)
             if entry["task"]:
                 entry["task"].cancel()
             entry["task"] = asyncio.create_task(_finalize_album(mgid))
         return
 
-    # Одиночное сообщение: текст или медиа+caption
+    # Одиночное сообщение: стикер, текст или медиа+caption
     src_chat_id = message.chat.id
     src_message_id = message.message_id
     text = message.caption if message.caption is not None else message.text
+    is_sticker = message.sticker is not None
     await state.update_data(
         src_chat_id=src_chat_id,
         src_message_id=src_message_id,
         src_message_ids=None,
         text=text,
         text_entities=None,
-        media_type=None,
+        media_type="sticker" if is_sticker else None,
         media_file_id=None,
         media_group=None,
     )
@@ -585,7 +590,7 @@ async def _finalize_album(mgid: str):
         src_chat_id=entry["chat_id"],
         src_message_id=None,
         src_message_ids=ids,
-        text=None,
+        text=entry.get("caption"),
         text_entities=None,
         media_type=None,
         media_file_id=None,

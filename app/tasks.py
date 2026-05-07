@@ -105,17 +105,30 @@ async def _send_post_async(post_id: int):
                 ids = list(p.src_message_ids)
                 await bot.copy_messages(chat_id=ch.chat_id, from_chat_id=p.src_chat_id, message_ids=ids)
                 if kb:
-                    # отдельным сообщением кнопки + текст (если есть)
-                    btn_text = p.text or "⬇️"
-                    await bot.send_message(chat_id=ch.chat_id, text=btn_text, entities=entities, parse_mode=pm, reply_markup=kb)
-            # 2) copy_message — одиночное сообщение из исходного чата
+                    # У альбомов нельзя прикрепить inline-клавиатуру в send_media_group/copy_messages,
+                    # поэтому отдельным сообщением шлём кнопки. В качестве текста берём caption альбома
+                    # (если есть) или подпись над кнопкой.
+                    btn_text = (p.text or "👇 Подробнее").strip() or "👇 Подробнее"
+                    await bot.send_message(chat_id=ch.chat_id, text=btn_text, reply_markup=kb)
+            # 2) одиночное сообщение из исходного чата
             elif p.src_chat_id and p.src_message_id:
-                await bot.copy_message(
-                    chat_id=ch.chat_id,
-                    from_chat_id=p.src_chat_id,
-                    message_id=p.src_message_id,
-                    reply_markup=kb,
-                )
+                # для стикеров используем forward, чтобы сохранить премиум-эффекты;
+                # copy_message у премиум-стикера их теряет
+                if p.media_type == "sticker":
+                    await bot.forward_message(
+                        chat_id=ch.chat_id,
+                        from_chat_id=p.src_chat_id,
+                        message_id=p.src_message_id,
+                    )
+                    if kb:
+                        await bot.send_message(chat_id=ch.chat_id, text="👇 Подробнее", reply_markup=kb)
+                else:
+                    await bot.copy_message(
+                        chat_id=ch.chat_id,
+                        from_chat_id=p.src_chat_id,
+                        message_id=p.src_message_id,
+                        reply_markup=kb,
+                    )
             # 3) legacy fallback — отправка по сохранённому file_id
             elif p.media_group:
                 media = []
