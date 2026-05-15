@@ -715,6 +715,7 @@ async def finalize_post(message: types.Message, state: FSMContext):
     src_chat_id = data.get("src_chat_id")
     src_message_id = data.get("src_message_id")
     src_message_ids = data.get("src_message_ids")
+    media_type = data.get("media_type")
     buttons = data.get("buttons") or None
 
     async with AsyncSessionLocal() as session:
@@ -745,8 +746,9 @@ async def finalize_post(message: types.Message, state: FSMContext):
             existing.weekday = weekday
             existing.week_in_cycle = None
             existing.next_run = next_run
+            # media_type нужен для стикеров (forward сохраняет premium-эффект)
+            existing.media_type = media_type
             # сбрасываем legacy-поля
-            existing.media_type = None
             existing.media_file_id = None
             existing.media_group = None
             existing.text_entities = None
@@ -757,6 +759,7 @@ async def finalize_post(message: types.Message, state: FSMContext):
                 src_chat_id=src_chat_id,
                 src_message_id=src_message_id,
                 src_message_ids=src_message_ids,
+                media_type=media_type,
                 buttons=buttons,
                 next_run=next_run,
                 weekday=weekday,
