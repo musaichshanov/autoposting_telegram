@@ -16,6 +16,7 @@ from sqlalchemy.future import select
 from sqlalchemy import or_
 from datetime import datetime, time as dtime, timedelta
 from app.utils import compute_next_weekday_time_tz
+from app.sender import deliver_post
 from zoneinfo import ZoneInfo
 
 load_dotenv()
@@ -197,46 +198,22 @@ async def cb_post_view(cq: types.CallbackQuery):
                 rows.append([InlineKeyboardButton(text=t, url=u)])
     post_kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     chat_id = cq.message.chat.id
-    if p.src_chat_id and p.src_message_ids:
-        try:
-            await bot.copy_messages(chat_id=chat_id, from_chat_id=p.src_chat_id, message_ids=list(p.src_message_ids))
-        except Exception:
-            await bot.send_message(chat_id=chat_id, text=p.text or "📸 Альбом")
-    elif p.src_chat_id and p.src_message_id:
-        try:
-            await bot.copy_message(chat_id=chat_id, from_chat_id=p.src_chat_id, message_id=p.src_message_id, reply_markup=post_kb)
-        except Exception:
-            await bot.send_message(chat_id=chat_id, text=p.text or "(превью недоступно)", reply_markup=post_kb)
-    elif p.media_group:
-        media = []
-        for it in p.media_group:
-            t = it.get("type")
-            fid = it.get("file_id")
-            if t == "photo":
-                media.append(InputMediaPhoto(media=fid))
-            elif t == "video":
-                media.append(InputMediaVideo(media=fid))
-            elif t == "document":
-                media.append(InputMediaDocument(media=fid))
-        if media:
-            await bot.send_media_group(chat_id=chat_id, media=media)
-        if p.text or post_kb:
-            await bot.send_message(chat_id=chat_id, text=p.text or "⬇️", reply_markup=post_kb)
-    elif p.media_type and p.media_file_id:
-        sender = {
-            "photo": bot.send_photo,
-            "video": bot.send_video,
-            "document": bot.send_document,
-            "voice": bot.send_voice,
-        }.get(p.media_type)
-        if sender:
-            kwargs = {"chat_id": chat_id, "caption": p.text, "reply_markup": post_kb}
-            kwargs[p.media_type] = p.media_file_id
-            await sender(**kwargs)
-        else:
-            await bot.send_message(chat_id=chat_id, text=p.text or "(медиа)", reply_markup=post_kb)
-    else:
-        await bot.send_message(chat_id=chat_id, text=p.text or "(пусто)", reply_markup=post_kb)
+    try:
+        await deliver_post(
+            bot,
+            chat_id,
+            text=p.text,
+            text_entities=p.text_entities,
+            media_type=p.media_type,
+            media_file_id=p.media_file_id,
+            media_group=p.media_group,
+            src_chat_id=p.src_chat_id,
+            src_message_id=p.src_message_id,
+            src_message_ids=p.src_message_ids,
+            kb=post_kb,
+        )
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=p.text or "(превью недоступно)", reply_markup=post_kb)
 
     manage = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"post_del:{p.id}")],
@@ -527,9 +504,33 @@ async def np_input_time(message: types.Message, state: FSMContext):
 
 # ---------- создание поста: контент (одно сообщение или альбом) ----------
 
-# Буфер для сборки альбомов: media_group_id -> {"chat_id":int, "ids":[message_id], "user_id":int, "task":Task}
+# Буфер для сборки альбомов: media_group_id -> {"chat_id":int, "items":[{type,file_id}], ...}
 _album_buffer: dict[str, dict] = {}
 _album_lock = asyncio.Lock()
+
+
+def _extract_media(message: types.Message):
+    """Определяет тип медиа и file_id для нативной отправки. Порядок важен:
+    animation (GIF) проверяем до document, т.к. Telegram может выставить оба."""
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    if message.video:
+        return "video", message.video.file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    if message.document:
+        return "document", message.document.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
+    if message.voice:
+        return "voice", message.voice.file_id
+    if message.video_note:
+        return "video_note", message.video_note.file_id
+    return None, None
+
+
+def _dump_entities(ents):
+    return [e.model_dump(exclude_none=True) for e in ents] if ents else None
 
 @dp.message(StateFilter(NewPost.input_content))
 async def np_input_content(message: types.Message, state: FSMContext):
@@ -542,35 +543,56 @@ async def np_input_content(message: types.Message, state: FSMContext):
                 entry = {
                     "chat_id": message.chat.id,
                     "ids": [],
+                    "items": [],
                     "caption": None,
+                    "caption_entities": None,
                     "user_id": message.from_user.id,
                     "state": state,
                     "task": None,
                 }
                 _album_buffer[mgid] = entry
             entry["ids"].append(message.message_id)
+            mt, fid = _extract_media(message)
+            if mt and fid:
+                entry["items"].append({"type": mt, "file_id": fid})
             # caption у альбома обычно на первом сообщении — берём первый непустой
             if not entry["caption"] and message.caption:
                 entry["caption"] = message.caption
+                entry["caption_entities"] = _dump_entities(message.caption_entities)
             # перезапускаем таймер ожидания (1.5с после последнего сообщения)
             if entry["task"]:
                 entry["task"].cancel()
             entry["task"] = asyncio.create_task(_finalize_album(mgid))
         return
 
-    # Одиночное сообщение: стикер, текст или медиа+caption
-    src_chat_id = message.chat.id
-    src_message_id = message.message_id
+    # Стикер: premium-эффект сохраняется только через forward из исходного чата
+    if message.sticker is not None:
+        await state.update_data(
+            src_chat_id=message.chat.id,
+            src_message_id=message.message_id,
+            src_message_ids=None,
+            text=None,
+            text_entities=None,
+            media_type="sticker",
+            media_file_id=None,
+            media_group=None,
+        )
+        await _show_buttons_menu(message, state)
+        return
+
+    # Одиночное сообщение: текст или медиа+caption.
+    # Шлём нативно с entities — это сохраняет premium-эмодзи (copy_message их теряет).
     text = message.caption if message.caption is not None else message.text
-    is_sticker = message.sticker is not None
+    raw_entities = message.caption_entities if message.caption is not None else message.entities
+    media_type, media_file_id = _extract_media(message)
     await state.update_data(
-        src_chat_id=src_chat_id,
-        src_message_id=src_message_id,
+        src_chat_id=None,
+        src_message_id=None,
         src_message_ids=None,
         text=text,
-        text_entities=None,
-        media_type="sticker" if is_sticker else None,
-        media_file_id=None,
+        text_entities=_dump_entities(raw_entities),
+        media_type=media_type,
+        media_file_id=media_file_id,
         media_group=None,
     )
     await _show_buttons_menu(message, state)
@@ -585,18 +607,18 @@ async def _finalize_album(mgid: str):
     if not entry:
         return
     state: FSMContext = entry["state"]
-    ids = sorted(entry["ids"])
+    items = entry.get("items") or []
     await state.update_data(
-        src_chat_id=entry["chat_id"],
+        src_chat_id=None,
         src_message_id=None,
-        src_message_ids=ids,
+        src_message_ids=None,
         text=entry.get("caption"),
-        text_entities=None,
+        text_entities=entry.get("caption_entities"),
         media_type=None,
         media_file_id=None,
-        media_group=None,
+        media_group=items or None,
     )
-    fake = await bot.send_message(chat_id=entry["chat_id"], text=f"📸 Альбом из {len(ids)} элемент(ов) принят.")
+    fake = await bot.send_message(chat_id=entry["chat_id"], text=f"📸 Альбом из {len(items)} элемент(ов) принят.")
     await _show_buttons_menu(fake, state)
 
 # ---------- создание поста: кнопки ----------
@@ -670,21 +692,20 @@ async def send_post_preview(message: types.Message, state: FSMContext):
             rows.append([InlineKeyboardButton(text=t, url=u)])
     post_kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
-    src_chat_id = data.get("src_chat_id")
-    src_message_id = data.get("src_message_id")
-    src_message_ids = data.get("src_message_ids")
-    text = data.get("text")
-
-    # Превью через copy_message — это сохранит premium-эмодзи и форматирование 1:1
-    if src_chat_id and src_message_ids:
-        await bot.copy_messages(chat_id=message.chat.id, from_chat_id=src_chat_id, message_ids=src_message_ids)
-        if post_kb:
-            await bot.send_message(chat_id=message.chat.id, text=(text or "⬇️"), reply_markup=post_kb)
-            await bot.send_message(chat_id=message.chat.id, text="ℹ️ У альбома кнопки прикрепляются отдельным сообщением.")
-    elif src_chat_id and src_message_id:
-        await bot.copy_message(chat_id=message.chat.id, from_chat_id=src_chat_id, message_id=src_message_id, reply_markup=post_kb)
-    else:
-        await bot.send_message(chat_id=message.chat.id, text=(text or "Пост без содержимого"), reply_markup=post_kb)
+    # Превью тем же кодом, что и реальная отправка — premium-эмодзи и форматирование 1:1
+    await deliver_post(
+        bot,
+        message.chat.id,
+        text=data.get("text"),
+        text_entities=data.get("text_entities"),
+        media_type=data.get("media_type"),
+        media_file_id=data.get("media_file_id"),
+        media_group=data.get("media_group"),
+        src_chat_id=data.get("src_chat_id"),
+        src_message_id=data.get("src_message_id"),
+        src_message_ids=data.get("src_message_ids"),
+        kb=post_kb,
+    )
 
     # сводка времени
     weekday = data.get("weekday")
@@ -716,6 +737,9 @@ async def finalize_post(message: types.Message, state: FSMContext):
     src_message_id = data.get("src_message_id")
     src_message_ids = data.get("src_message_ids")
     media_type = data.get("media_type")
+    media_file_id = data.get("media_file_id")
+    media_group = data.get("media_group")
+    text_entities = data.get("text_entities")
     buttons = data.get("buttons") or None
 
     async with AsyncSessionLocal() as session:
@@ -746,12 +770,10 @@ async def finalize_post(message: types.Message, state: FSMContext):
             existing.weekday = weekday
             existing.week_in_cycle = None
             existing.next_run = next_run
-            # media_type нужен для стикеров (forward сохраняет premium-эффект)
             existing.media_type = media_type
-            # сбрасываем legacy-поля
-            existing.media_file_id = None
-            existing.media_group = None
-            existing.text_entities = None
+            existing.media_file_id = media_file_id
+            existing.media_group = media_group
+            existing.text_entities = text_entities
         else:
             post = Post(
                 channel_id=ch_id,
@@ -760,6 +782,9 @@ async def finalize_post(message: types.Message, state: FSMContext):
                 src_message_id=src_message_id,
                 src_message_ids=src_message_ids,
                 media_type=media_type,
+                media_file_id=media_file_id,
+                media_group=media_group,
+                text_entities=text_entities,
                 buttons=buttons,
                 next_run=next_run,
                 weekday=weekday,

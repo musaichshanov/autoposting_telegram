@@ -3,8 +3,7 @@ from .celery_app import celery
 from .models import Post, Channel
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.types import MessageEntity
-from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from .sender import deliver_post
 import os
 import asyncio
 from sqlalchemy.future import select
@@ -84,96 +83,22 @@ async def _send_post_async(post_id: int):
                 rows.append([InlineKeyboardButton(text=p.button_text, url=p.button_url)])
             if rows:
                 kb = InlineKeyboardMarkup(inline_keyboard=rows)
-            entities = None
-            if p.text_entities:
-                try:
-                    entities = [MessageEntity(**e) for e in p.text_entities]
-                except Exception:
-                    entities = None
-            def detect_parse_mode(text: str | None) -> str | None:
-                if not text:
-                    return None
-                if any(tag in text for tag in ("<b>", "<i>", "<u>", "<a ", "</")):
-                    return "HTML"
-                if any(ch in text for ch in ("*", "_", "~", "`", "[", "]", "(", ")", ">", "#")):
-                    return "MarkdownV2"
-                return None
-            pm = None if entities else detect_parse_mode(p.text)
 
-            # 1) copy_messages — альбом, скопированный из исходного чата (сохраняет premium emoji)
-            if p.src_chat_id and p.src_message_ids:
-                ids = list(p.src_message_ids)
-                await bot.copy_messages(chat_id=ch.chat_id, from_chat_id=p.src_chat_id, message_ids=ids)
-                if kb:
-                    # У альбомов нельзя прикрепить inline-клавиатуру в send_media_group/copy_messages,
-                    # поэтому отдельным сообщением шлём кнопки. В качестве текста берём caption альбома
-                    # (если есть) или подпись над кнопкой.
-                    btn_text = (p.text or "👇 Подробнее").strip() or "👇 Подробнее"
-                    await bot.send_message(chat_id=ch.chat_id, text=btn_text, reply_markup=kb)
-            # 2) одиночное сообщение из исходного чата
-            elif p.src_chat_id and p.src_message_id:
-                # для стикеров используем forward, чтобы сохранить премиум-эффекты;
-                # copy_message у премиум-стикера их теряет
-                if p.media_type == "sticker":
-                    await bot.forward_message(
-                        chat_id=ch.chat_id,
-                        from_chat_id=p.src_chat_id,
-                        message_id=p.src_message_id,
-                    )
-                    if kb:
-                        await bot.send_message(chat_id=ch.chat_id, text="👇 Подробнее", reply_markup=kb)
-                else:
-                    await bot.copy_message(
-                        chat_id=ch.chat_id,
-                        from_chat_id=p.src_chat_id,
-                        message_id=p.src_message_id,
-                        reply_markup=kb,
-                    )
-            # 3) legacy fallback — отправка по сохранённому file_id
-            elif p.media_group:
-                media = []
-                add_caption_to_first = not kb and (p.text or entities)
-                for idx, it in enumerate(p.media_group):
-                    t = it.get("type")
-                    fid = it.get("file_id")
-                    if idx == 0 and add_caption_to_first:
-                        if entities:
-                            if t == "photo":
-                                media.append(InputMediaPhoto(media=fid, caption=p.text, caption_entities=entities))
-                            elif t == "video":
-                                media.append(InputMediaVideo(media=fid, caption=p.text, caption_entities=entities))
-                            elif t == "document":
-                                media.append(InputMediaDocument(media=fid, caption=p.text, caption_entities=entities))
-                        else:
-                            if t == "photo":
-                                media.append(InputMediaPhoto(media=fid, caption=p.text, parse_mode=pm))
-                            elif t == "video":
-                                media.append(InputMediaVideo(media=fid, caption=p.text, parse_mode=pm))
-                            elif t == "document":
-                                media.append(InputMediaDocument(media=fid, caption=p.text, parse_mode=pm))
-                    else:
-                        if t == "photo":
-                            media.append(InputMediaPhoto(media=fid))
-                        elif t == "video":
-                            media.append(InputMediaVideo(media=fid))
-                        elif t == "document":
-                            media.append(InputMediaDocument(media=fid))
-                if media:
-                    await bot.send_media_group(chat_id=ch.chat_id, media=media)
-                    if kb and p.text:
-                        await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "photo":
-                await bot.send_photo(chat_id=ch.chat_id, photo=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "video":
-                await bot.send_video(chat_id=ch.chat_id, video=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "document":
-                await bot.send_document(chat_id=ch.chat_id, document=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "voice":
-                await bot.send_voice(chat_id=ch.chat_id, voice=p.media_file_id, caption=p.text, caption_entities=entities, parse_mode=pm, reply_markup=kb)
-            elif p.media_type == "video_note":
-                await bot.send_video_note(chat_id=ch.chat_id, video_note=p.media_file_id)
-            else:
-                await bot.send_message(chat_id=ch.chat_id, text=p.text, entities=entities, parse_mode=pm, reply_markup=kb)
+            # Единая логика доставки: нативная отправка с entities сохраняет premium-эмодзи,
+            # стикеры идут через forward, старые посты — через copy (fallback внутри deliver_post).
+            await deliver_post(
+                bot,
+                ch.chat_id,
+                text=p.text,
+                text_entities=p.text_entities,
+                media_type=p.media_type,
+                media_file_id=p.media_file_id,
+                media_group=p.media_group,
+                src_chat_id=p.src_chat_id,
+                src_message_id=p.src_message_id,
+                src_message_ids=p.src_message_ids,
+                kb=kb,
+            )
 
             # success: пост одноразовый — next_run сбрасываем
             await session.execute(
